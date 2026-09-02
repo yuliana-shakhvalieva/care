@@ -785,8 +785,9 @@ def _starm_configured_tasks(tools_cfg: Any | None) -> str:
         )
     ]
     return (
-        " This deployment serves these tasks, each with the EXACT input format "
-        "its `problem` must use: "
+        " THIS deployment serves ONLY these tasks — pass one of these exact "
+        "strings as `task`, with the EXACT input format its `problem` must "
+        "use: "
         + "; ".join(lines)
         + ". Encode the user's puzzle into that format yourself — pass the "
         "encoded puzzle ONLY."
@@ -1202,13 +1203,25 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
         {
             "name": "starm_solve",
             "source": "care:builtin",
+            # The task ids are named here so a planner emits a valid one
+            # instead of inventing "Game of Life". They're a hint, not a
+            # contract: the server stays the authority (a name it doesn't
+            # serve comes back as its own 422), and a configured deployment
+            # narrows the list to the servers it actually runs, below.
             "description": (
                 "starm_solve(problem: str, task='', port=None, "
                 "puzzle_id=None) -> str. Solve one ALGORITHMIC puzzle with a "
                 "STARM model — a small recurrent solver that follows an "
-                "algorithm exactly, where an LLM guesses. Use it for sudoku, "
-                "mazes/shortest paths, ARC-AGI grids, recovering arithmetic "
-                "operators, and Game-of-Life generations. "
+                "algorithm exactly, where an LLM guesses. "
+                "`task` is a STARM task id, spelled EXACTLY as one of: "
+                "'sudoku' (fill a 9x9 grid), 'maze' (shortest path through a "
+                "grid), 'arc' (ARC-AGI abstract grid transformation), "
+                "'arithmetic' (recover the operators of an expression), "
+                "'game_of_life' (advance a Life pattern N generations). "
+                "Lower-case with underscores — 'Game of Life' or 'sudoku "
+                "puzzle' are not task ids. A deployment serves only the "
+                "subset it runs servers for; that subset, and each one's "
+                "input format, is listed below when configured. "
                 "CRITICAL: `problem` is NOT a question and NOT a sentence — it "
                 "is the puzzle ENCODED in its task's own text format, and "
                 "nothing else. Strip every word of the user's phrasing, "

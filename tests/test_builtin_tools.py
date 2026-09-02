@@ -650,6 +650,14 @@ def test_starm_input_formats_are_fetched_once():
     assert route.call_count == 1
 
 
+def test_starm_spec_lists_the_task_ids():
+    """A planner can't guess 'game_of_life' from prose about Life."""
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
+    description = by_name["starm_solve"]["description"]
+    for task in ("sudoku", "maze", "arc", "arithmetic", "game_of_life"):
+        assert f"'{task}'" in description, task
+
+
 def test_starm_spec_forbids_prose_in_problem():
     """The instruction that stops `problem` becoming the user's question."""
     by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
