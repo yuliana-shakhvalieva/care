@@ -39,7 +39,6 @@ import inspect
 import logging
 import re
 from datetime import datetime, timezone
-from functools import lru_cache
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -732,79 +731,6 @@ _STARM_TASK_IDS: tuple[str, ...] = (
     "game_of_life",
 )
 
-#: How long the description builder waits on one server's ``/info``. Short:
-#: this runs before generation, and a missing format only costs precision.
-_STARM_INFO_TIMEOUT = 2.0
-
-
-@lru_cache(maxsize=8)
-def _starm_input_formats(
-    host: str, ports: tuple[tuple[str, int], ...]
-) -> tuple[tuple[str, str], ...]:
-    """Ask each configured STARM server how its task spells a prompt.
-
-    A planner cannot invent a task's encoding — that ``'<pattern>|<step>'``
-    or ``'81 cells, . for blanks'`` lives in the checkpoint's tokenizer, and
-    guessing it produces a prompt the server rejects. So the format is
-    fetched from the servers themselves (``GET /info`` → ``input_format``)
-    and quoted into the tool description, which keeps the single copy of it
-    on the STARM side.
-
-    Best-effort and cached for the process: a server that's down simply
-    contributes no format, and the description falls back to naming the
-    task. Never raises — this runs on the generation path.
-    """
-    import httpx
-
-    formats: list[tuple[str, str]] = []
-    for task, port in ports:
-        text = ""
-        try:
-            with httpx.Client(timeout=httpx.Timeout(_STARM_INFO_TIMEOUT)) as client:
-                resp = client.get(f"{_starm_base_url(host, port, port)}/info")
-                resp.raise_for_status()
-                payload = resp.json()
-            if isinstance(payload, dict):
-                text = str(payload.get("input_format", "")).strip()
-        except Exception as exc:  # noqa: BLE001 — advertising is best-effort
-            _log.debug("starm /info unavailable for %s on %s: %s", task, port, exc)
-        formats.append((task, text))
-    return tuple(formats)
-
-
-def _starm_configured_tasks(tools_cfg: Any | None) -> str:
-    """Name this deployment's STARM servers — and how each spells a prompt.
-
-    The planner can only pick a task it knows exists, and the set is
-    deployment-specific (``CareConfig.tools.starm_ports``), so it belongs in
-    the advertised description rather than in a prompt the user has to write.
-    Each task's own input format rides along (see
-    :func:`_starm_input_formats`) because naming a task isn't enough: a
-    planner that doesn't know the encoding passes the user's question
-    through as prose, and the server rejects it.
-
-    Empty string when nothing is configured, leaving the generic blurb.
-    """
-    ports = dict(getattr(tools_cfg, "starm_ports", None) or {}) if tools_cfg else {}
-    if not ports:
-        return ""
-    known = tuple(sorted(ports.items()))
-    lines = [
-        f"{task} — {fmt}" if fmt else task
-        for task, fmt in _starm_input_formats(
-            str(getattr(tools_cfg, "starm_host", "") or "http://localhost"), known
-        )
-    ]
-    return (
-        " THIS deployment serves ONLY these tasks — pass one of these exact "
-        "strings as `task_id`, with the EXACT input format its `problem` must "
-        "use: "
-        + "; ".join(lines)
-        + ". Encode the user's puzzle into that format yourself — pass the "
-        "encoded puzzle ONLY."
-    )
-
-
 def _make_starm_solve(
     host: str,
     ports: dict[str, int] | None,
@@ -830,25 +756,15 @@ def _make_starm_solve(
 
     async def starm_solve(
         problem: str,
-        # Advertised as required (see `builtin_tool_specs`) but defaulted
-        # here on purpose: a planner that still omits it must get a readable
-        # instruction back, not a TypeError that aborts the whole step.
-        #
-        # Named `task_id`, not `task`: a parameter called "task" reads as
-        # "what to do", and planners duly filled it with instructions
-        # ("Compute next generation") instead of the identifier the server
-        # matches on. `task` survives as an alias so already-generated
-        # chains keep working.
-        task_id: str = "",
+        task_id: str,
         port: Any = None,
         puzzle_id: Any = None,
-        task: str = "",
     ) -> str:
         """Solve an algorithmic puzzle with a STARM model; returns its answer."""
         import httpx
 
         text = str(problem or "").strip()
-        served = str(task_id or task or "").strip()
+        served = str(task_id or "").strip()
         pid = str(puzzle_id or "").strip()
 
         known = ", ".join(sorted(port_map)) if port_map else ", ".join(_STARM_TASK_IDS)
@@ -893,31 +809,10 @@ def _make_starm_solve(
 
         base = _starm_base_url(host, resolved_port, default_port)
 
+        if not text:
+            return "starm_solve: empty problem — pass the puzzle as `problem`."
+
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-
-            async def describe() -> dict[str, Any]:
-                """What this server serves. Best-effort: used to quote the
-                prompt format back on a rejection, which isn't worth failing
-                the step over."""
-                try:
-                    resp = await client.get(f"{base}/info")
-                    resp.raise_for_status()
-                    info = resp.json()
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning("starm_solve GET %s/info failed: %s", base, exc)
-                    return {}
-                return info if isinstance(info, dict) else {}
-
-            if not text:
-                info = await describe()
-                fmt = str(info.get("input_format", "")).strip()
-                return (
-                    f"starm_solve: empty problem — pass the puzzle as `problem`. "
-                    f"{base} serves the "
-                    f"{str(info.get('task', '')).strip() or served!r} task"
-                    + (f"; its input format is: {fmt}" if fmt else "")
-                )
-
             payload: dict[str, Any] = {"task": served, "input": text}
             if pid:
                 payload["puzzle_id"] = pid
@@ -931,17 +826,9 @@ def _make_starm_solve(
                 )
 
             if resp.status_code >= 400:
-                detail = _starm_detail(resp)
-                hint = ""
-                if resp.status_code == 422:
-                    # The server rejected the prompt itself — its own
-                    # input_format is exactly what the next step needs to fix it.
-                    fmt = str((await describe()).get("input_format", "")).strip()
-                    if fmt:
-                        hint = f" The {served!r} task's input format is: {fmt}"
                 return (
                     f"starm_solve: {base} rejected the request "
-                    f"(HTTP {resp.status_code}): {detail}{hint}"
+                    f"(HTTP {resp.status_code}): {_starm_detail(resp)}"
                 )
 
             try:
@@ -1222,54 +1109,16 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
         {
             "name": "starm_solve",
             "source": "care:builtin",
-            # The task ids are named here so a planner emits a valid one
-            # instead of inventing "Game of Life". They're a hint, not a
-            # contract: the server stays the authority (a name it doesn't
-            # serve comes back as its own 422), and a configured deployment
-            # narrows the list to the servers it actually runs, below.
+            # Task ids are listed so a planner emits a valid one instead of
+            # inventing "Game of Life"; the server stays the authority.
             "description": (
                 "starm_solve(problem: str, task_id: str, port=None, "
                 "puzzle_id=None) -> str. BOTH `problem` AND `task_id` are "
-                "REQUIRED — a call that omits `task_id` fails without "
-                "reaching the solver. Solve one ALGORITHMIC puzzle with a "
-                "STARM model — a small recurrent solver that follows an "
-                "algorithm exactly, where an LLM guesses. "
-                "`task_id` selects WHICH solver runs. It is NOT a "
-                "description of the work: 'Compute next generation', 'solve "
-                "it' or any sentence is wrong and is rejected. It is a STARM "
-                "task id, spelled EXACTLY as one of: "
-                "'sudoku' (fill a 9x9 grid), 'maze' (shortest path through a "
-                "grid), 'arc' (ARC-AGI abstract grid transformation), "
-                "'arithmetic' (recover the operators of an expression), "
-                "'game_of_life' (advance a Life pattern N generations). "
-                "Lower-case with underscores — 'Game of Life' or 'sudoku "
-                "puzzle' are not task ids. A deployment serves only the "
-                "subset it runs servers for; that subset, and each one's "
-                "input format, is listed below when configured. "
-                "CRITICAL: `problem` is NOT a question and NOT a sentence — it "
-                "is the puzzle ENCODED in its task's own text format, and "
-                "nothing else. Strip every word of the user's phrasing, "
-                "extract the puzzle data, and re-encode it. Passing prose "
-                "(\'what happens to bbb$ooo$bbb after 1 generation?\') is "
-                "always wrong; the encoded form (\'bbb$ooo$bbb|1\') is what "
-                "the server parses. "
-                "EVERY number the user states — how many generations to "
-                "advance, which step to reach, the target value — is part "
-                "of `problem`, not a separate argument and not something "
-                "to drop: there is nowhere else to put it. 'bbb$ooo$bbb' "
-                "alone is INCOMPLETE and the server rejects it; "
-                "'bbb$ooo$bbb|1' is the same puzzle carrying the count "
-                "the user asked for. Copy the shape of the example in the "
-                "task's format below exactly — every separator ('|', "
-                "'$', '=') and any trailing number it shows. "
-                "Each STARM server serves ONE task on its own port, so "
-                "`task_id` picks which solver answers and the port is "
-                "configured, not "
-                "guessed; `port` overrides it only for a server not yet in the "
-                "config. `puzzle_id` is ARC-only and required there (e.g. "
-                "\'007bbfb7\'). Calling with an empty `problem` returns the "
-                "server\'s own format description."
-                + _starm_configured_tasks(tools_cfg)
+                "REQUIRED. Return the solution for tasks: sudoku, game of life, arithmetic, ARC-AGI, maze. "
+                "ALWAYS use this (never solve puzzle by yourself) for ANY request to solve one of sudoku, "
+                "game of life, arithmetic, ARC-AGI. `task_id` specifies task to solve, should be one of "
+                "`sudoku`, `maze`, `arc`, `arithmetic`, `game_of_life` - NOTHING ELSE. "
+                "`problem` is the puzzle itself as you got it from the user."
             ),
             "tags": list(_TAGS_ALGORITHMIC),
         },

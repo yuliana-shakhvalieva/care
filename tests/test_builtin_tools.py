@@ -369,39 +369,22 @@ def test_starm_solve_posts_generate_and_returns_the_answer():
     assert body == {"task": "sudoku", "input": "53..."}  # no puzzle_id for non-ARC
 
 
-@respx.mock
-def test_starm_solve_requires_the_task():
-    """`task` is not inferred: a planner that omits it gets told to name one.
-
-    It used to be filled in from the server's /info, which rewarded leaving
-    it out — and a planner that hasn't chosen a solver usually hasn't
-    encoded the puzzle for one either.
-    """
-    info = respx.get("http://localhost:8080/info")
-    out = asyncio.run(_starm()("##..##"))
+@respx.mock(assert_all_called=False)
+def test_starm_solve_blank_task_id_names_the_valid_ids(respx_mock):
+    """An empty string still reaches the body — answer it before the network."""
+    out = asyncio.run(_starm()("##..##", task_id="  "))
     assert "`task_id` is required" in out
-    assert info.call_count == 0  # answered before any network call
-    # The valid answers are named, so the retry can be right.
+    assert not respx_mock.calls  # answered without touching the network
     for task in ("sudoku", "maze", "arc", "arithmetic", "game_of_life"):
         assert task in out
 
 
-def test_starm_solve_missing_task_lists_the_configured_tasks():
+def test_starm_solve_blank_task_id_lists_the_configured_tasks():
     """With servers configured, only those are worth naming."""
-    out = asyncio.run(_starm(ports={"sudoku": 8080, "maze": 8081})("x"))
+    out = asyncio.run(_starm(ports={"sudoku": 8080, "maze": 8081})("x", task_id=""))
     assert "`task_id` is required" in out
     assert "maze" in out and "sudoku" in out
     assert "arithmetic" not in out  # not served here
-
-
-@respx.mock
-def test_starm_solve_skips_info_when_the_task_is_given():
-    info = respx.get("http://localhost:8080/info")
-    respx.post("http://localhost:8080/generate").mock(
-        return_value=httpx.Response(200, json={"output": "x", "steps": 1, "max_steps": 4})
-    )
-    asyncio.run(_starm()("53...", task_id="sudoku"))
-    assert info.call_count == 0  # one call, not two
 
 
 @respx.mock
@@ -411,45 +394,6 @@ def test_starm_solve_forwards_puzzle_id_for_arc():
     )
     asyncio.run(_starm()("0 0\n1 1", task_id="arc", puzzle_id="007bbfb7"))
     assert json.loads(route.calls[0].request.content)["puzzle_id"] == "007bbfb7"
-
-
-@respx.mock
-def test_starm_solve_empty_problem_quotes_the_servers_input_format():
-    """The format belongs to the checkpoint — ask, never keep a copy."""
-    respx.get("http://localhost:8080/info").mock(
-        return_value=httpx.Response(
-            200,
-            json={"task": "sudoku", "input_format": "81 cells, '.' for blanks"},
-        )
-    )
-    out = asyncio.run(_starm()("   ", task_id="sudoku"))
-    assert "empty problem" in out
-    assert "81 cells" in out
-
-
-@respx.mock
-def test_starm_solve_422_carries_the_servers_diagnosis_and_format():
-    respx.post("http://localhost:8080/generate").mock(
-        return_value=httpx.Response(422, json={"detail": "81 cells expected, got 12"})
-    )
-    respx.get("http://localhost:8080/info").mock(
-        return_value=httpx.Response(
-            200, json={"task": "sudoku", "input_format": "81 cells, '.' for blanks"}
-        )
-    )
-    out = asyncio.run(_starm()("53...", task_id="sudoku"))
-    assert "81 cells expected, got 12" in out  # the server's own message
-    assert "81 cells, '.' for blanks" in out  # plus how to fix it
-
-
-@respx.mock
-def test_starm_solve_422_without_info_still_reports_the_rejection():
-    respx.post("http://localhost:8080/generate").mock(
-        return_value=httpx.Response(422, json={"detail": "wrong task"})
-    )
-    respx.get("http://localhost:8080/info").mock(side_effect=httpx.ConnectError("down"))
-    out = asyncio.run(_starm()("x", task_id="sudoku"))
-    assert "wrong task" in out
 
 
 @respx.mock
@@ -534,21 +478,22 @@ def test_starm_solve_rejects_a_description_in_task_id():
     assert "game_of_life" in out  # the answer it should have given
 
 
-def test_starm_solve_accepts_task_as_a_legacy_alias():
-    """Chains generated before the rename keep working."""
-    with respx.mock:
-        respx.post("http://localhost:8080/generate").mock(
-            return_value=httpx.Response(
-                200, json={"output": "ok", "steps": 1, "max_steps": 2}
-            )
-        )
-        out = asyncio.run(_starm()("x", task="sudoku"))
-    assert "ok" in out
+def test_starm_solve_without_task_id_raises():
+    """No default: the step fails loudly instead of returning an
+    instruction that the next step could mistake for an answer."""
+    with pytest.raises(TypeError):
+        asyncio.run(_starm()("bbb$ooo$bbb|1"))
+
+
+def test_starm_solve_rejects_the_old_task_keyword():
+    """`task` was never shipped as a parameter — it reads as "what to do"."""
+    with pytest.raises(TypeError):
+        asyncio.run(_starm()("x", task="sudoku"))
 
 
 def test_starm_solve_single_configured_server_still_needs_the_task():
     """Even with one server, the task is stated rather than assumed."""
-    out = asyncio.run(_starm(ports={"sudoku": 8080})("53..."))
+    out = asyncio.run(_starm(ports={"sudoku": 8080})("53...", task_id=""))
     assert "`task_id` is required" in out
 
 
@@ -580,80 +525,13 @@ def test_starm_ports_empty_by_default():
     assert CareConfig().tools.starm_ports == {}
 
 
-@pytest.fixture(autouse=True)
-def _clear_starm_info_cache():
-    """`_starm_input_formats` memoises per process; tests mock different
-    servers, so the cache must not leak between them."""
-    builtin_tools._starm_input_formats.cache_clear()
-    yield
-    builtin_tools._starm_input_formats.cache_clear()
-
-
-@respx.mock
-def test_starm_spec_names_the_configured_tasks():
-    """MAGE can only pick a task it's told exists."""
-    respx.get("http://localhost:8080/info").mock(
-        return_value=httpx.Response(200, json={"task": "sudoku", "input_format": ""})
-    )
-    respx.get("http://localhost:8081/info").mock(
-        return_value=httpx.Response(200, json={"task": "maze", "input_format": ""})
-    )
-    cfg = CareConfig()
-    cfg.tools.starm_ports = {"sudoku": 8080, "maze": 8081}
-    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg.tools)}
-    description = by_name["starm_solve"]["description"]
-    assert "maze" in description and "sudoku" in description
-    # Nothing configured -> no such claim, and no network call.
-    plain = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
-    assert "This deployment serves" not in plain["starm_solve"]["description"]
-
-
-@respx.mock
-def test_starm_spec_quotes_each_tasks_input_format():
-    """The encoding lives in the checkpoint, so it's fetched, not guessed.
-
-    Without it a planner passes the user's prose straight through and the
-    server rejects it — the failure this covers.
-    """
-    respx.get("http://localhost:8082/info").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "task": "game_of_life",
-                "input_format": "pattern then the generation count: 'bbo$obb|3'",
-            },
-        )
-    )
-    cfg = CareConfig()
-    cfg.tools.starm_ports = {"game_of_life": 8082}
-    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg.tools)}
-    description = by_name["starm_solve"]["description"]
-    assert "game_of_life — pattern then the generation count: 'bbo$obb|3'" in description
-
-
-@respx.mock
-def test_starm_spec_survives_an_unreachable_server():
-    """Advertising is best-effort: a server that's down still gets named."""
-    respx.get("http://localhost:9999/info").mock(
-        side_effect=httpx.ConnectError("refused")
-    )
-    cfg = CareConfig()
-    cfg.tools.starm_ports = {"maze": 9999}
-    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg.tools)}
-    assert "maze" in by_name["starm_solve"]["description"]
-
-
-@respx.mock
-def test_starm_input_formats_are_fetched_once():
-    """This runs on the generation path — one probe per server, not per call."""
-    route = respx.get("http://localhost:8080/info").mock(
-        return_value=httpx.Response(200, json={"task": "sudoku", "input_format": "81 cells"})
-    )
-    cfg = CareConfig()
-    cfg.tools.starm_ports = {"sudoku": 8080}
-    for _ in range(3):
+def test_starm_spec_never_probes_a_server():
+    """Building the description is offline — no /info, no network at all."""
+    with respx.mock(assert_all_called=False) as mock:
+        cfg = CareConfig()
+        cfg.tools.starm_ports = {"sudoku": 8080, "maze": 8081}
         builtin_tools.builtin_tool_specs(cfg.tools)
-    assert route.call_count == 1
+        assert not mock.calls
 
 
 def test_starm_spec_lists_the_task_ids():
@@ -661,32 +539,13 @@ def test_starm_spec_lists_the_task_ids():
     by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
     description = by_name["starm_solve"]["description"]
     for task in ("sudoku", "maze", "arc", "arithmetic", "game_of_life"):
-        assert f"'{task}'" in description, task
-
-
-def test_starm_spec_forbids_prose_in_problem():
-    """The instruction that stops `problem` becoming the user's question."""
-    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
-    description = by_name["starm_solve"]["description"]
-    assert "NOT a question" in description
-    assert "bbb$ooo$bbb|1" in description  # encoded form shown against the prose one
-
-
-def test_starm_spec_demands_the_users_numbers_inside_problem():
-    """Planners dropped the generation count: it reads as an aside in the
-    question, but there is no argument to carry it."""
-    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
-    description = by_name["starm_solve"]["description"]
-    assert "EVERY number the user states" in description
-    assert "nowhere else to put it" in description
-    # The incomplete form is named as such, next to the complete one.
-    assert "'bbb$ooo$bbb' alone is INCOMPLETE" in description
+        assert f"`{task}`" in description, task
 
 
 def test_starm_solve_spec_documents_its_signature():
     by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
     description = by_name["starm_solve"]["description"]
-    assert "starm_solve(problem: str, task_id: str" in description  # no default
+    assert "starm_solve(problem: str, task_id: str," in description  # no default
     assert "BOTH `problem` AND `task_id` are REQUIRED" in description
     assert "port" in description and "puzzle_id" in description
     assert "algorithmic" in by_name["starm_solve"]["tags"]
