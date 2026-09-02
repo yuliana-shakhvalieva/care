@@ -574,16 +574,88 @@ def test_starm_ports_empty_by_default():
     assert CareConfig().tools.starm_ports == {}
 
 
+@pytest.fixture(autouse=True)
+def _clear_starm_info_cache():
+    """`_starm_input_formats` memoises per process; tests mock different
+    servers, so the cache must not leak between them."""
+    builtin_tools._starm_input_formats.cache_clear()
+    yield
+    builtin_tools._starm_input_formats.cache_clear()
+
+
+@respx.mock
 def test_starm_spec_names_the_configured_tasks():
     """MAGE can only pick a task it's told exists."""
+    respx.get("http://localhost:8080/info").mock(
+        return_value=httpx.Response(200, json={"task": "sudoku", "input_format": ""})
+    )
+    respx.get("http://localhost:8081/info").mock(
+        return_value=httpx.Response(200, json={"task": "maze", "input_format": ""})
+    )
     cfg = CareConfig()
     cfg.tools.starm_ports = {"sudoku": 8080, "maze": 8081}
     by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg.tools)}
     description = by_name["starm_solve"]["description"]
-    assert "This deployment serves: maze, sudoku" in description
-    # Nothing configured -> no such claim.
+    assert "maze" in description and "sudoku" in description
+    # Nothing configured -> no such claim, and no network call.
     plain = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
     assert "This deployment serves" not in plain["starm_solve"]["description"]
+
+
+@respx.mock
+def test_starm_spec_quotes_each_tasks_input_format():
+    """The encoding lives in the checkpoint, so it's fetched, not guessed.
+
+    Without it a planner passes the user's prose straight through and the
+    server rejects it — the failure this covers.
+    """
+    respx.get("http://localhost:8082/info").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "task": "game_of_life",
+                "input_format": "pattern then the generation count: 'bbo$obb|3'",
+            },
+        )
+    )
+    cfg = CareConfig()
+    cfg.tools.starm_ports = {"game_of_life": 8082}
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg.tools)}
+    description = by_name["starm_solve"]["description"]
+    assert "game_of_life — pattern then the generation count: 'bbo$obb|3'" in description
+
+
+@respx.mock
+def test_starm_spec_survives_an_unreachable_server():
+    """Advertising is best-effort: a server that's down still gets named."""
+    respx.get("http://localhost:9999/info").mock(
+        side_effect=httpx.ConnectError("refused")
+    )
+    cfg = CareConfig()
+    cfg.tools.starm_ports = {"maze": 9999}
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg.tools)}
+    assert "maze" in by_name["starm_solve"]["description"]
+
+
+@respx.mock
+def test_starm_input_formats_are_fetched_once():
+    """This runs on the generation path — one probe per server, not per call."""
+    route = respx.get("http://localhost:8080/info").mock(
+        return_value=httpx.Response(200, json={"task": "sudoku", "input_format": "81 cells"})
+    )
+    cfg = CareConfig()
+    cfg.tools.starm_ports = {"sudoku": 8080}
+    for _ in range(3):
+        builtin_tools.builtin_tool_specs(cfg.tools)
+    assert route.call_count == 1
+
+
+def test_starm_spec_forbids_prose_in_problem():
+    """The instruction that stops `problem` becoming the user's question."""
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
+    description = by_name["starm_solve"]["description"]
+    assert "NOT a question" in description
+    assert "bbb$ooo$bbb|1" in description  # encoded form shown against the prose one
 
 
 def test_starm_solve_spec_documents_its_signature():

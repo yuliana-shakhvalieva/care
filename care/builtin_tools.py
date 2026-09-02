@@ -39,6 +39,7 @@ import inspect
 import logging
 import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -720,21 +721,75 @@ def _starm_task_key(task: str) -> str:
     return str(task or "").strip().lower().replace("-", "_")
 
 
+#: How long the description builder waits on one server's ``/info``. Short:
+#: this runs before generation, and a missing format only costs precision.
+_STARM_INFO_TIMEOUT = 2.0
+
+
+@lru_cache(maxsize=8)
+def _starm_input_formats(
+    host: str, ports: tuple[tuple[str, int], ...]
+) -> tuple[tuple[str, str], ...]:
+    """Ask each configured STARM server how its task spells a prompt.
+
+    A planner cannot invent a task's encoding — that ``'<pattern>|<step>'``
+    or ``'81 cells, . for blanks'`` lives in the checkpoint's tokenizer, and
+    guessing it produces a prompt the server rejects. So the format is
+    fetched from the servers themselves (``GET /info`` → ``input_format``)
+    and quoted into the tool description, which keeps the single copy of it
+    on the STARM side.
+
+    Best-effort and cached for the process: a server that's down simply
+    contributes no format, and the description falls back to naming the
+    task. Never raises — this runs on the generation path.
+    """
+    import httpx
+
+    formats: list[tuple[str, str]] = []
+    for task, port in ports:
+        text = ""
+        try:
+            with httpx.Client(timeout=httpx.Timeout(_STARM_INFO_TIMEOUT)) as client:
+                resp = client.get(f"{_starm_base_url(host, port, port)}/info")
+                resp.raise_for_status()
+                payload = resp.json()
+            if isinstance(payload, dict):
+                text = str(payload.get("input_format", "")).strip()
+        except Exception as exc:  # noqa: BLE001 — advertising is best-effort
+            _log.debug("starm /info unavailable for %s on %s: %s", task, port, exc)
+        formats.append((task, text))
+    return tuple(formats)
+
+
 def _starm_configured_tasks(tools_cfg: Any | None) -> str:
-    """Name this deployment's STARM servers in the tool description.
+    """Name this deployment's STARM servers — and how each spells a prompt.
 
     The planner can only pick a task it knows exists, and the set is
-    deployment-specific (``CareConfig.tools.starm_ports``) — so it belongs in
+    deployment-specific (``CareConfig.tools.starm_ports``), so it belongs in
     the advertised description rather than in a prompt the user has to write.
+    Each task's own input format rides along (see
+    :func:`_starm_input_formats`) because naming a task isn't enough: a
+    planner that doesn't know the encoding passes the user's question
+    through as prose, and the server rejects it.
+
     Empty string when nothing is configured, leaving the generic blurb.
     """
     ports = dict(getattr(tools_cfg, "starm_ports", None) or {}) if tools_cfg else {}
     if not ports:
         return ""
+    known = tuple(sorted(ports.items()))
+    lines = [
+        f"{task} — {fmt}" if fmt else task
+        for task, fmt in _starm_input_formats(
+            str(getattr(tools_cfg, "starm_host", "") or "http://localhost"), known
+        )
+    ]
     return (
-        " This deployment serves: "
-        + ", ".join(sorted(ports))
-        + ". Pass one of those as `task`; the port is configured, never guessed."
+        " This deployment serves these tasks, each with the EXACT input format "
+        "its `problem` must use: "
+        + "; ".join(lines)
+        + ". Encode the user's puzzle into that format yourself — pass the "
+        "encoded puzzle ONLY."
     )
 
 
@@ -1153,13 +1208,23 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
                 "STARM model — a small recurrent solver that follows an "
                 "algorithm exactly, where an LLM guesses. Use it for sudoku, "
                 "mazes/shortest paths, ARC-AGI grids, recovering arithmetic "
-                "operators, and Game-of-Life generations. Pass the puzzle "
-                "verbatim as `problem`. Each STARM server serves ONE task on "
-                "its own port, so `port` picks which solver answers; `task` "
-                "is optional — the server is asked when it's omitted. "
-                "`puzzle_id` is ARC-only and required there (e.g. '007bbfb7'). "
-                "The prompt's text format is the task's own; call with an "
-                "empty `problem` to have the server state it."
+                "operators, and Game-of-Life generations. "
+                "CRITICAL: `problem` is NOT a question and NOT a sentence — it "
+                "is the puzzle ENCODED in its task's own text format, and "
+                "nothing else. Strip every word of the user's phrasing, "
+                "extract the puzzle data, and re-encode it. Passing prose "
+                "(\'what happens to bbb$ooo$bbb after 1 generation?\') is "
+                "always wrong; the encoded form (\'bbb$ooo$bbb|1\') is what "
+                "the server parses. Details the user states in words — a "
+                "generation count, a step number, a target — usually belong "
+                "INSIDE the encoding, so read the task\'s format below before "
+                "building `problem`. "
+                "Each STARM server serves ONE task on its own port, so `task` "
+                "picks which solver answers and the port is configured, not "
+                "guessed; `port` overrides it only for a server not yet in the "
+                "config. `puzzle_id` is ARC-only and required there (e.g. "
+                "\'007bbfb7\'). Calling with an empty `problem` returns the "
+                "server\'s own format description."
                 + _starm_configured_tasks(tools_cfg)
             ),
             "tags": list(_TAGS_ALGORITHMIC),
