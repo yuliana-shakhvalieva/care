@@ -797,7 +797,7 @@ def _starm_configured_tasks(tools_cfg: Any | None) -> str:
     ]
     return (
         " THIS deployment serves ONLY these tasks — pass one of these exact "
-        "strings as `task`, with the EXACT input format its `problem` must "
+        "strings as `task_id`, with the EXACT input format its `problem` must "
         "use: "
         + "; ".join(lines)
         + ". Encode the user's puzzle into that format yourself — pass the "
@@ -833,27 +833,47 @@ def _make_starm_solve(
         # Advertised as required (see `builtin_tool_specs`) but defaulted
         # here on purpose: a planner that still omits it must get a readable
         # instruction back, not a TypeError that aborts the whole step.
-        task: str = "",
+        #
+        # Named `task_id`, not `task`: a parameter called "task" reads as
+        # "what to do", and planners duly filled it with instructions
+        # ("Compute next generation") instead of the identifier the server
+        # matches on. `task` survives as an alias so already-generated
+        # chains keep working.
+        task_id: str = "",
         port: Any = None,
         puzzle_id: Any = None,
+        task: str = "",
     ) -> str:
         """Solve an algorithmic puzzle with a STARM model; returns its answer."""
         import httpx
 
         text = str(problem or "").strip()
-        served = str(task or "").strip()
+        served = str(task_id or task or "").strip()
         pid = str(puzzle_id or "").strip()
 
-        # `task` is required, not inferred. It used to be filled in from the
-        # server's /info when omitted, which quietly rewarded a planner for
-        # leaving it out — and a planner that leaves it out has usually not
-        # decided WHICH solver it wants, so the next thing it gets wrong is
-        # the encoding. Demanding it keeps the choice explicit.
+        known = ", ".join(sorted(port_map)) if port_map else ", ".join(_STARM_TASK_IDS)
+
+        # `task_id` is required, not inferred. It used to be filled in from
+        # the server's /info when omitted, which quietly rewarded a planner
+        # for leaving it out — and a planner that leaves it out has usually
+        # not decided WHICH solver it wants, so the next thing it gets wrong
+        # is the encoding. Demanding it keeps the choice explicit.
         if not served:
-            known = ", ".join(sorted(port_map)) if port_map else ", ".join(_STARM_TASK_IDS)
             return (
-                "starm_solve: `task` is required — name the STARM task this "
+                "starm_solve: `task_id` is required — name the STARM task this "
                 f"puzzle belongs to. Available: {known}."
+            )
+
+        # Reject a description before spending a request on it. A planner
+        # that wrote "Compute next generation" here has misread the field,
+        # and the fix it needs is the list of ids, not a 422 about a task
+        # the server never heard of.
+        valid = set(port_map) if port_map else set(_STARM_TASK_IDS)
+        if _starm_task_key(served) not in valid:
+            return (
+                f"starm_solve: {served!r} is not a STARM task id. `task_id` "
+                "names WHICH solver to use, not what to do with the puzzle — "
+                f"pass exactly one of: {known}."
             )
 
         resolved_port: int | None = None
@@ -867,13 +887,9 @@ def _make_starm_solve(
                     "port the STARM server for this task listens on."
                 )
         elif port_map:
-            resolved_port = port_map.get(_starm_task_key(served))
-            if resolved_port is None:
-                return (
-                    f"starm_solve: no STARM server is configured for the "
-                    f"{served!r} task. Configured tasks: "
-                    f"{', '.join(sorted(port_map))}."
-                )
+            # Safe: an id outside the map was already rejected above, so the
+            # lookup cannot miss.
+            resolved_port = port_map[_starm_task_key(served)]
 
         base = _starm_base_url(host, resolved_port, default_port)
 
@@ -1212,13 +1228,16 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
             # serve comes back as its own 422), and a configured deployment
             # narrows the list to the servers it actually runs, below.
             "description": (
-                "starm_solve(problem: str, task: str, port=None, "
-                "puzzle_id=None) -> str. BOTH `problem` AND `task` are "
-                "REQUIRED — a call that omits `task` fails without reaching "
-                "the solver. Solve one ALGORITHMIC puzzle with a "
+                "starm_solve(problem: str, task_id: str, port=None, "
+                "puzzle_id=None) -> str. BOTH `problem` AND `task_id` are "
+                "REQUIRED — a call that omits `task_id` fails without "
+                "reaching the solver. Solve one ALGORITHMIC puzzle with a "
                 "STARM model — a small recurrent solver that follows an "
                 "algorithm exactly, where an LLM guesses. "
-                "`task` is a STARM task id, spelled EXACTLY as one of: "
+                "`task_id` selects WHICH solver runs. It is NOT a "
+                "description of the work: 'Compute next generation', 'solve "
+                "it' or any sentence is wrong and is rejected. It is a STARM "
+                "task id, spelled EXACTLY as one of: "
                 "'sudoku' (fill a 9x9 grid), 'maze' (shortest path through a "
                 "grid), 'arc' (ARC-AGI abstract grid transformation), "
                 "'arithmetic' (recover the operators of an expression), "
@@ -1237,8 +1256,9 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
                 "generation count, a step number, a target — usually belong "
                 "INSIDE the encoding, so read the task\'s format below before "
                 "building `problem`. "
-                "Each STARM server serves ONE task on its own port, so `task` "
-                "picks which solver answers and the port is configured, not "
+                "Each STARM server serves ONE task on its own port, so "
+                "`task_id` picks which solver answers and the port is "
+                "configured, not "
                 "guessed; `port` overrides it only for a server not yet in the "
                 "config. `puzzle_id` is ARC-only and required there (e.g. "
                 "\'007bbfb7\'). Calling with an empty `problem` returns the "
