@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -298,6 +299,302 @@ def test_http_request_success(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# starm_solve
+# ---------------------------------------------------------------------------
+
+
+def _starm(host="http://localhost", ports=None, port=8080, timeout=5.0):
+    return builtin_tools._make_starm_solve(host, ports, port, timeout)
+
+
+def test_starm_base_url_appends_the_call_port():
+    # The configured host carries no port; the per-call port picks the server.
+    assert (
+        builtin_tools._starm_base_url("http://gpu-01", 8081, 8080)
+        == "http://gpu-01:8081"
+    )
+
+
+def test_starm_base_url_defaults_and_normalises_scheme():
+    assert builtin_tools._starm_base_url("gpu-01", None, 8080) == "http://gpu-01:8080"
+
+
+def test_starm_base_url_call_port_overrides_one_in_the_host():
+    assert (
+        builtin_tools._starm_base_url("http://localhost:9000", 8081, 8080)
+        == "http://localhost:8081"
+    )
+
+
+def test_starm_base_url_keeps_a_host_port_when_no_call_port():
+    assert (
+        builtin_tools._starm_base_url("http://localhost:9000", None, 8080)
+        == "http://localhost:9000"
+    )
+
+
+def test_coerce_port():
+    assert builtin_tools._coerce_port("8081") == 8081
+    assert builtin_tools._coerce_port(8081) == 8081
+    assert builtin_tools._coerce_port("nope") is None
+    assert builtin_tools._coerce_port(0) is None
+    assert builtin_tools._coerce_port(70000) is None
+
+
+def test_starm_solve_rejects_a_bad_port():
+    out = asyncio.run(_starm()("53 puzzle", task="sudoku", port="eight"))
+    assert "not a valid TCP port" in out
+
+
+@respx.mock
+def test_starm_solve_posts_generate_and_returns_the_answer():
+    route = respx.post("http://localhost:8081/generate").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "task": "sudoku",
+                "input": "53...",
+                "output": "534678912",
+                "steps": 12,
+                "max_steps": 16,
+                "puzzle_id": None,
+            },
+        )
+    )
+    out = asyncio.run(_starm()("53...", task="sudoku", port=8081))
+    assert "534678912" in out
+    assert "12/16" in out  # the ACT step count is carried through
+    assert route.call_count == 1
+    body = json.loads(route.calls[0].request.content)
+    assert body == {"task": "sudoku", "input": "53..."}  # no puzzle_id for non-ARC
+
+
+@respx.mock
+def test_starm_solve_asks_the_server_which_task_it_serves():
+    """Task omitted: the server is the authority, so /info answers it."""
+    info = respx.get("http://localhost:8080/info").mock(
+        return_value=httpx.Response(
+            200, json={"task": "maze", "input_format": "grid of # and ."}
+        )
+    )
+    gen = respx.post("http://localhost:8080/generate").mock(
+        return_value=httpx.Response(
+            200, json={"output": "SSEE", "steps": 3, "max_steps": 8}
+        )
+    )
+    out = asyncio.run(_starm()("##..##"))
+    assert "SSEE" in out
+    assert info.call_count == 1
+    assert json.loads(gen.calls[0].request.content)["task"] == "maze"
+
+
+@respx.mock
+def test_starm_solve_skips_info_when_the_task_is_given():
+    info = respx.get("http://localhost:8080/info")
+    respx.post("http://localhost:8080/generate").mock(
+        return_value=httpx.Response(200, json={"output": "x", "steps": 1, "max_steps": 4})
+    )
+    asyncio.run(_starm()("53...", task="sudoku"))
+    assert info.call_count == 0  # one call, not two
+
+
+@respx.mock
+def test_starm_solve_forwards_puzzle_id_for_arc():
+    route = respx.post("http://localhost:8080/generate").mock(
+        return_value=httpx.Response(200, json={"output": "0 1", "steps": 2, "max_steps": 8})
+    )
+    asyncio.run(_starm()("0 0\n1 1", task="arc", puzzle_id="007bbfb7"))
+    assert json.loads(route.calls[0].request.content)["puzzle_id"] == "007bbfb7"
+
+
+@respx.mock
+def test_starm_solve_empty_problem_quotes_the_servers_input_format():
+    """The format belongs to the checkpoint — ask, never keep a copy."""
+    respx.get("http://localhost:8080/info").mock(
+        return_value=httpx.Response(
+            200,
+            json={"task": "sudoku", "input_format": "81 cells, '.' for blanks"},
+        )
+    )
+    out = asyncio.run(_starm()("   "))
+    assert "empty problem" in out
+    assert "81 cells" in out
+
+
+@respx.mock
+def test_starm_solve_422_carries_the_servers_diagnosis_and_format():
+    respx.post("http://localhost:8080/generate").mock(
+        return_value=httpx.Response(422, json={"detail": "81 cells expected, got 12"})
+    )
+    respx.get("http://localhost:8080/info").mock(
+        return_value=httpx.Response(
+            200, json={"task": "sudoku", "input_format": "81 cells, '.' for blanks"}
+        )
+    )
+    out = asyncio.run(_starm()("53...", task="sudoku"))
+    assert "81 cells expected, got 12" in out  # the server's own message
+    assert "81 cells, '.' for blanks" in out  # plus how to fix it
+
+
+@respx.mock
+def test_starm_solve_422_without_info_still_reports_the_rejection():
+    respx.post("http://localhost:8080/generate").mock(
+        return_value=httpx.Response(422, json={"detail": "wrong task"})
+    )
+    respx.get("http://localhost:8080/info").mock(side_effect=httpx.ConnectError("down"))
+    out = asyncio.run(_starm()("x", task="sudoku"))
+    assert "wrong task" in out
+
+
+@respx.mock
+def test_starm_solve_unreachable_server_is_graceful():
+    respx.post("http://localhost:8080/generate").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    out = asyncio.run(_starm()("53...", task="sudoku"))
+    assert "starm_solve error" in out
+    assert "Is a STARM server running" in out
+
+
+@respx.mock
+def test_starm_solve_unreachable_server_when_asking_for_the_task():
+    respx.get("http://localhost:8080/info").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    out = asyncio.run(_starm()("53..."))
+    assert "cannot reach a STARM server" in out
+
+
+@respx.mock
+def test_starm_solve_empty_output_is_reported():
+    respx.post("http://localhost:8080/generate").mock(
+        return_value=httpx.Response(200, json={"output": "  ", "steps": 1, "max_steps": 4})
+    )
+    out = asyncio.run(_starm()("x", task="sudoku"))
+    assert "empty answer" in out
+
+
+@respx.mock
+def test_starm_solve_honours_the_configured_host():
+    respx.post("http://gpu-01:8081/generate").mock(
+        return_value=httpx.Response(200, json={"output": "ok", "steps": 1, "max_steps": 2})
+    )
+    out = asyncio.run(_starm(host="http://gpu-01")("x", task="sudoku", port=8081))
+    assert "ok" in out
+
+
+def test_starm_solve_registered_with_config_values():
+    """The registered tool is bound to the config, not to hardcoded defaults."""
+    cfg = CareConfig()
+    cfg.tools.starm_host = "http://gpu-02"
+    cfg.tools.starm_port = 9100
+    ctx = _StubCtx()
+    builtin_tools.register_builtin_tools(ctx, cfg.tools, cfg.sandbox)
+    with respx.mock:
+        route = respx.post("http://gpu-02:9100/generate").mock(
+            return_value=httpx.Response(
+                200, json={"output": "bound", "steps": 1, "max_steps": 2}
+            )
+        )
+        out = asyncio.run(ctx.registered["starm_solve"]("x", task="sudoku"))
+    assert "bound" in out and route.call_count == 1
+
+
+@respx.mock
+def test_starm_solve_takes_the_port_from_the_task_map():
+    """The deployment knows the port; the prompt only names the task."""
+    route = respx.post("http://localhost:8081/generate").mock(
+        return_value=httpx.Response(
+            200, json={"output": "SSEE", "steps": 3, "max_steps": 8}
+        )
+    )
+    tool = _starm(ports={"sudoku": 8080, "maze": 8081})
+    out = asyncio.run(tool("##..##", task="maze"))
+    assert "SSEE" in out and route.call_count == 1
+
+
+@respx.mock
+def test_starm_solve_task_lookup_ignores_case_and_dashes():
+    respx.post("http://localhost:8082/generate").mock(
+        return_value=httpx.Response(200, json={"output": "o", "steps": 1, "max_steps": 2})
+    )
+    tool = _starm(ports={"game_of_life": 8082})
+    assert "o" in asyncio.run(tool("bbo$obb|3", task="Game-of-Life"))
+
+
+def test_starm_solve_unconfigured_task_lists_the_configured_ones():
+    tool = _starm(ports={"sudoku": 8080, "maze": 8081})
+    out = asyncio.run(tool("x", task="chess"))
+    assert "no STARM server is configured" in out
+    assert "maze" in out and "sudoku" in out
+
+
+@respx.mock
+def test_starm_solve_single_configured_server_needs_no_task():
+    route = respx.post("http://localhost:8080/generate").mock(
+        return_value=httpx.Response(200, json={"output": "9", "steps": 1, "max_steps": 2})
+    )
+    out = asyncio.run(_starm(ports={"sudoku": 8080})("53..."))
+    assert "9" in out
+    # The task came from the map, so the server was never asked for it.
+    assert json.loads(route.calls[0].request.content)["task"] == "sudoku"
+
+
+def test_starm_solve_several_servers_ask_for_the_task():
+    out = asyncio.run(_starm(ports={"sudoku": 8080, "maze": 8081})("x"))
+    assert "name the one to use as `task`" in out
+    assert "maze" in out and "sudoku" in out
+
+
+@respx.mock
+def test_starm_solve_explicit_port_overrides_the_map():
+    respx.post("http://localhost:9999/generate").mock(
+        return_value=httpx.Response(200, json={"output": "ok", "steps": 1, "max_steps": 2})
+    )
+    tool = _starm(ports={"sudoku": 8080})
+    assert "ok" in asyncio.run(tool("x", task="sudoku", port=9999))
+
+
+def test_starm_ports_parse_from_an_env_style_string():
+    cfg = CareConfig(tools={"starm_ports": "sudoku=8080, maze=8081"})
+    assert cfg.tools.starm_ports == {"sudoku": 8080, "maze": 8081}
+
+
+def test_starm_ports_parse_from_json():
+    cfg = CareConfig(tools={"starm_ports": '{"arc": 8083}'})
+    assert cfg.tools.starm_ports == {"arc": 8083}
+
+
+def test_starm_ports_drop_unusable_entries_instead_of_crashing():
+    cfg = CareConfig(tools={"starm_ports": "sudoku=8080,maze=nope,arc=99999"})
+    assert cfg.tools.starm_ports == {"sudoku": 8080}
+
+
+def test_starm_ports_empty_by_default():
+    assert CareConfig().tools.starm_ports == {}
+
+
+def test_starm_spec_names_the_configured_tasks():
+    """MAGE can only pick a task it's told exists."""
+    cfg = CareConfig()
+    cfg.tools.starm_ports = {"sudoku": 8080, "maze": 8081}
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg.tools)}
+    description = by_name["starm_solve"]["description"]
+    assert "This deployment serves: maze, sudoku" in description
+    # Nothing configured -> no such claim.
+    plain = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
+    assert "This deployment serves" not in plain["starm_solve"]["description"]
+
+
+def test_starm_solve_spec_documents_its_signature():
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
+    description = by_name["starm_solve"]["description"]
+    assert "starm_solve(problem" in description
+    assert "port" in description and "puzzle_id" in description
+    assert "algorithmic" in by_name["starm_solve"]["tags"]
+
+
+# ---------------------------------------------------------------------------
 # run_python (sandboxed)
 # ---------------------------------------------------------------------------
 
@@ -335,6 +632,7 @@ _EXPECTED = {
     "http_request",
     "calculator",
     "current_datetime",
+    "starm_solve",
     "run_python",
 }
 

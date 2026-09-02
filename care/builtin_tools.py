@@ -40,6 +40,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 _log = logging.getLogger("care.builtin_tools")
 
@@ -51,6 +52,7 @@ _TAGS_WEB = ["information", "external", "web"]
 _TAGS_MATH = ["math", "compute"]
 _TAGS_TIME = ["time", "utility"]
 _TAGS_CODE = ["code", "compute", "external"]
+_TAGS_ALGORITHMIC = ["algorithmic", "reasoning", "external"]
 
 # Recency intent (EN + RU) — "latest/newest/current/last…" / "последний/новый…".
 _RECENCY_RE = re.compile(
@@ -648,6 +650,251 @@ async def _force_remove_container(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# starm_solve — one HTTP call to a STARM inference server
+# ---------------------------------------------------------------------------
+
+
+def _coerce_port(value: Any) -> int | None:
+    """Parse a port out of whatever the planner passed. ``None`` when it
+    isn't a usable TCP port, so the caller can say so instead of quietly
+    talking to the wrong server."""
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _starm_base_url(host: str, port: int | None, default_port: int) -> str:
+    """Compose a STARM server's base URL from the configured host + a port.
+
+    ``CareConfig.tools.starm_host`` carries no port by convention: one STARM
+    process serves one checkpoint (= one task), so a box runs several of them
+    on neighbouring ports and only the port varies per call. A host that DOES
+    carry a port is still honoured — an explicit ``port`` argument overrides
+    it, otherwise it stands.
+    """
+    raw = str(host or "").strip() or "http://localhost"
+    if "://" not in raw:
+        raw = "http://" + raw
+    parts = urlsplit(raw)
+    resolved = port or parts.port or default_port
+    hostname = parts.hostname or "localhost"
+    if ":" in hostname:  # IPv6 literal — urlsplit strips the brackets
+        hostname = f"[{hostname}]"
+    return urlunsplit(
+        (
+            parts.scheme or "http",
+            f"{hostname}:{resolved}",
+            parts.path.rstrip("/"),
+            "",
+            "",
+        )
+    )
+
+
+def _starm_detail(response: Any) -> str:
+    """Best-effort human text out of a STARM error response.
+
+    ``/generate`` answers 4xx with ``{"detail": ...}`` — a string for a
+    tokenizer/routing error, a list of Pydantic error dicts for a malformed
+    body. Both are worth showing verbatim: they are the server's own
+    diagnosis of the prompt.
+    """
+    try:
+        detail = response.json().get("detail")
+    except Exception:  # noqa: BLE001 — a non-JSON body is still worth showing
+        return (response.text or "").strip()
+    if isinstance(detail, str):
+        return detail
+    if detail is None:
+        return (response.text or "").strip()
+    return str(detail)
+
+
+def _starm_task_key(task: str) -> str:
+    """Fold a task name for port lookup, so ``Game-of-Life`` matches the
+    ``game_of_life`` a config was written with. Only the *lookup* is
+    lenient — whatever the caller spelled is what goes to the server, whose
+    own 422 is the authority on a name it doesn't serve."""
+    return str(task or "").strip().lower().replace("-", "_")
+
+
+def _starm_configured_tasks(tools_cfg: Any | None) -> str:
+    """Name this deployment's STARM servers in the tool description.
+
+    The planner can only pick a task it knows exists, and the set is
+    deployment-specific (``CareConfig.tools.starm_ports``) — so it belongs in
+    the advertised description rather than in a prompt the user has to write.
+    Empty string when nothing is configured, leaving the generic blurb.
+    """
+    ports = dict(getattr(tools_cfg, "starm_ports", None) or {}) if tools_cfg else {}
+    if not ports:
+        return ""
+    return (
+        " This deployment serves: "
+        + ", ".join(sorted(ports))
+        + ". Pass one of those as `task`; the port is configured, never guessed."
+    )
+
+
+def _make_starm_solve(
+    host: str,
+    ports: dict[str, int] | None,
+    default_port: int,
+    timeout: float,
+) -> Callable[..., Any]:
+    """Build ``starm_solve`` bound to the configured STARM deployment.
+
+    STARM (Single Task Algorithmic Reasoning Models) serves one trained
+    checkpoint per process over a small HTTP API: ``GET /info`` describes the
+    task it serves and the text format that task's prompts take, and
+    ``POST /generate`` answers one. This tool is only that call — the task
+    list, the prompt formats, the ARC puzzle-id resolution and the answer
+    decoding all stay on the server, which is the only place they are
+    correct for a given checkpoint.
+
+    ``ports`` maps task -> port (``CareConfig.tools.starm_ports``). Which
+    port a task lives on is a property of the deployment, not of the
+    question, so a chain names the task and the port is looked up here — no
+    user should have to type ``8080`` into a prompt.
+    """
+    port_map = {_starm_task_key(k): v for k, v in (ports or {}).items()}
+
+    async def starm_solve(
+        problem: str,
+        task: str = "",
+        port: Any = None,
+        puzzle_id: Any = None,
+    ) -> str:
+        """Solve an algorithmic puzzle with a STARM model; returns its answer."""
+        import httpx
+
+        text = str(problem or "").strip()
+        served = str(task or "").strip()
+        pid = str(puzzle_id or "").strip()
+
+        resolved_port: int | None = None
+        if port not in (None, ""):
+            # An explicit port always wins — it's the escape hatch for a
+            # server that isn't in the config yet.
+            resolved_port = _coerce_port(port)
+            if resolved_port is None:
+                return (
+                    f"starm_solve: {port!r} is not a valid TCP port — pass the "
+                    "port the STARM server for this task listens on."
+                )
+        elif port_map:
+            known = ", ".join(sorted(port_map))
+            if served:
+                resolved_port = port_map.get(_starm_task_key(served))
+                if resolved_port is None:
+                    return (
+                        f"starm_solve: no STARM server is configured for the "
+                        f"{served!r} task. Configured tasks: {known}."
+                    )
+            elif len(port_map) == 1:
+                # One server configured — no ambiguity about which to ask.
+                only_task, only_port = next(iter(port_map.items()))
+                served, resolved_port = only_task, only_port
+            else:
+                return (
+                    "starm_solve: several STARM servers are configured, so name "
+                    f"the one to use as `task`. Configured tasks: {known}."
+                )
+
+        base = _starm_base_url(host, resolved_port, default_port)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+
+            async def describe() -> dict[str, Any]:
+                """What this server serves. Best-effort: used to fill in an
+                omitted task and to quote the prompt format back on a
+                rejection, neither of which is worth failing the step over."""
+                try:
+                    resp = await client.get(f"{base}/info")
+                    resp.raise_for_status()
+                    info = resp.json()
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("starm_solve GET %s/info failed: %s", base, exc)
+                    return {}
+                return info if isinstance(info, dict) else {}
+
+            if not text:
+                info = await describe()
+                served = served or str(info.get("task", "")).strip()
+                fmt = str(info.get("input_format", "")).strip()
+                return (
+                    f"starm_solve: empty problem — pass the puzzle as `problem`. "
+                    f"{base} serves the {served or 'unknown'!r} task"
+                    + (f"; its input format is: {fmt}" if fmt else "")
+                )
+
+            if not served:
+                # One checkpoint, one task: the server is the authority on
+                # which, and /generate rejects a mismatch. Asking beats
+                # guessing, and beats keeping our own copy of the task list.
+                info = await describe()
+                served = str(info.get("task", "")).strip()
+                if not served:
+                    return (
+                        f"starm_solve error: cannot reach a STARM server at {base} "
+                        "to ask which task it serves. Check the port, or pass the "
+                        "task name as `task`."
+                    )
+
+            payload: dict[str, Any] = {"task": served, "input": text}
+            if pid:
+                payload["puzzle_id"] = pid
+            try:
+                resp = await client.post(f"{base}/generate", json=payload)
+            except Exception as exc:  # noqa: BLE001 — surface, don't abort the step
+                _log.warning("starm_solve POST %s/generate failed: %s", base, exc)
+                return (
+                    f"starm_solve error (POST {base}/generate): {exc}. "
+                    "Is a STARM server running on that port?"
+                )
+
+            if resp.status_code >= 400:
+                detail = _starm_detail(resp)
+                hint = ""
+                if resp.status_code == 422:
+                    # The server rejected the prompt itself — its own
+                    # input_format is exactly what the next step needs to fix it.
+                    fmt = str((await describe()).get("input_format", "")).strip()
+                    if fmt:
+                        hint = f" The {served!r} task's input format is: {fmt}"
+                return (
+                    f"starm_solve: {base} rejected the request "
+                    f"(HTTP {resp.status_code}): {detail}{hint}"
+                )
+
+            try:
+                data = resp.json()
+            except Exception as exc:  # noqa: BLE001
+                return f"starm_solve error: {base} returned a non-JSON body: {exc}"
+            if not isinstance(data, dict):
+                return f"starm_solve error: unexpected response shape from {base}"
+
+            output = str(data.get("output", "")).strip()
+            if not output:
+                return (
+                    f"starm_solve: {base} returned an empty answer "
+                    f"for the {served!r} task."
+                )
+            steps = data.get("steps")
+            max_steps = data.get("max_steps")
+            trace = (
+                f" in {steps}/{max_steps} recursion steps"
+                if steps is not None and max_steps is not None
+                else ""
+            )
+            return f"STARM {served!r}{trace}:\n{output}"
+
+    return starm_solve
+
+
+# ---------------------------------------------------------------------------
 # calculator
 # ---------------------------------------------------------------------------
 
@@ -743,6 +990,10 @@ def register_builtin_tools(
     fetch_max = int(getattr(tools_cfg, "fetch_url_max_chars", 4000) or 4000)
     enable_code_exec = bool(getattr(tools_cfg, "enable_code_exec", True))
     code_timeout = int(getattr(tools_cfg, "code_exec_timeout", 60) or 60)
+    starm_host = str(getattr(tools_cfg, "starm_host", "") or "http://localhost")
+    starm_ports = dict(getattr(tools_cfg, "starm_ports", None) or {})
+    starm_port = int(getattr(tools_cfg, "starm_port", 8080) or 8080)
+    starm_timeout = float(getattr(tools_cfg, "starm_timeout", 120.0) or 120.0)
 
     # (name, callable, tags, timeout-seconds)
     specs: list[tuple[str, Callable[..., Any], list[str], float | None]] = [
@@ -758,6 +1009,14 @@ def register_builtin_tools(
         ("http_request", _make_http_request(fetch_max), _TAGS_WEB, None),
         ("calculator", calculator, _TAGS_MATH, 5.0),
         ("current_datetime", current_datetime, _TAGS_TIME, 5.0),
+        (
+            "starm_solve",
+            _make_starm_solve(
+                starm_host, starm_ports, starm_port, starm_timeout
+            ),
+            _TAGS_ALGORITHMIC,
+            None,
+        ),
     ]
     if enable_code_exec:
         specs.append(
@@ -884,6 +1143,26 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
                 "sense of 'today' is stale and will be WRONG."
             ),
             "tags": list(_TAGS_TIME),
+        },
+        {
+            "name": "starm_solve",
+            "source": "care:builtin",
+            "description": (
+                "starm_solve(problem: str, task='', port=None, "
+                "puzzle_id=None) -> str. Solve one ALGORITHMIC puzzle with a "
+                "STARM model — a small recurrent solver that follows an "
+                "algorithm exactly, where an LLM guesses. Use it for sudoku, "
+                "mazes/shortest paths, ARC-AGI grids, recovering arithmetic "
+                "operators, and Game-of-Life generations. Pass the puzzle "
+                "verbatim as `problem`. Each STARM server serves ONE task on "
+                "its own port, so `port` picks which solver answers; `task` "
+                "is optional — the server is asked when it's omitted. "
+                "`puzzle_id` is ARC-only and required there (e.g. '007bbfb7'). "
+                "The prompt's text format is the task's own; call with an "
+                "empty `problem` to have the server state it."
+                + _starm_configured_tasks(tools_cfg)
+            ),
+            "tags": list(_TAGS_ALGORITHMIC),
         },
     ]
     enable_code = True if tools_cfg is None else bool(
