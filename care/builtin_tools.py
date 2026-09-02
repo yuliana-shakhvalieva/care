@@ -721,6 +721,17 @@ def _starm_task_key(task: str) -> str:
     return str(task or "").strip().lower().replace("-", "_")
 
 
+#: STARM's task ids, as its tokenizer registry spells them. Named here so a
+#: call with no `task` can say what the valid answers are; the server stays
+#: the authority on what IT serves (an unknown name comes back as its 422).
+_STARM_TASK_IDS: tuple[str, ...] = (
+    "sudoku",
+    "maze",
+    "arc",
+    "arithmetic",
+    "game_of_life",
+)
+
 #: How long the description builder waits on one server's ``/info``. Short:
 #: this runs before generation, and a missing format only costs precision.
 _STARM_INFO_TIMEOUT = 2.0
@@ -819,6 +830,9 @@ def _make_starm_solve(
 
     async def starm_solve(
         problem: str,
+        # Advertised as required (see `builtin_tool_specs`) but defaulted
+        # here on purpose: a planner that still omits it must get a readable
+        # instruction back, not a TypeError that aborts the whole step.
         task: str = "",
         port: Any = None,
         puzzle_id: Any = None,
@@ -829,6 +843,18 @@ def _make_starm_solve(
         text = str(problem or "").strip()
         served = str(task or "").strip()
         pid = str(puzzle_id or "").strip()
+
+        # `task` is required, not inferred. It used to be filled in from the
+        # server's /info when omitted, which quietly rewarded a planner for
+        # leaving it out — and a planner that leaves it out has usually not
+        # decided WHICH solver it wants, so the next thing it gets wrong is
+        # the encoding. Demanding it keeps the choice explicit.
+        if not served:
+            known = ", ".join(sorted(port_map)) if port_map else ", ".join(_STARM_TASK_IDS)
+            return (
+                "starm_solve: `task` is required — name the STARM task this "
+                f"puzzle belongs to. Available: {known}."
+            )
 
         resolved_port: int | None = None
         if port not in (None, ""):
@@ -841,22 +867,12 @@ def _make_starm_solve(
                     "port the STARM server for this task listens on."
                 )
         elif port_map:
-            known = ", ".join(sorted(port_map))
-            if served:
-                resolved_port = port_map.get(_starm_task_key(served))
-                if resolved_port is None:
-                    return (
-                        f"starm_solve: no STARM server is configured for the "
-                        f"{served!r} task. Configured tasks: {known}."
-                    )
-            elif len(port_map) == 1:
-                # One server configured — no ambiguity about which to ask.
-                only_task, only_port = next(iter(port_map.items()))
-                served, resolved_port = only_task, only_port
-            else:
+            resolved_port = port_map.get(_starm_task_key(served))
+            if resolved_port is None:
                 return (
-                    "starm_solve: several STARM servers are configured, so name "
-                    f"the one to use as `task`. Configured tasks: {known}."
+                    f"starm_solve: no STARM server is configured for the "
+                    f"{served!r} task. Configured tasks: "
+                    f"{', '.join(sorted(port_map))}."
                 )
 
         base = _starm_base_url(host, resolved_port, default_port)
@@ -864,9 +880,9 @@ def _make_starm_solve(
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
 
             async def describe() -> dict[str, Any]:
-                """What this server serves. Best-effort: used to fill in an
-                omitted task and to quote the prompt format back on a
-                rejection, neither of which is worth failing the step over."""
+                """What this server serves. Best-effort: used to quote the
+                prompt format back on a rejection, which isn't worth failing
+                the step over."""
                 try:
                     resp = await client.get(f"{base}/info")
                     resp.raise_for_status()
@@ -878,26 +894,13 @@ def _make_starm_solve(
 
             if not text:
                 info = await describe()
-                served = served or str(info.get("task", "")).strip()
                 fmt = str(info.get("input_format", "")).strip()
                 return (
                     f"starm_solve: empty problem — pass the puzzle as `problem`. "
-                    f"{base} serves the {served or 'unknown'!r} task"
+                    f"{base} serves the "
+                    f"{str(info.get('task', '')).strip() or served!r} task"
                     + (f"; its input format is: {fmt}" if fmt else "")
                 )
-
-            if not served:
-                # One checkpoint, one task: the server is the authority on
-                # which, and /generate rejects a mismatch. Asking beats
-                # guessing, and beats keeping our own copy of the task list.
-                info = await describe()
-                served = str(info.get("task", "")).strip()
-                if not served:
-                    return (
-                        f"starm_solve error: cannot reach a STARM server at {base} "
-                        "to ask which task it serves. Check the port, or pass the "
-                        "task name as `task`."
-                    )
 
             payload: dict[str, Any] = {"task": served, "input": text}
             if pid:
@@ -1209,8 +1212,10 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
             # serve comes back as its own 422), and a configured deployment
             # narrows the list to the servers it actually runs, below.
             "description": (
-                "starm_solve(problem: str, task='', port=None, "
-                "puzzle_id=None) -> str. Solve one ALGORITHMIC puzzle with a "
+                "starm_solve(problem: str, task: str, port=None, "
+                "puzzle_id=None) -> str. BOTH `problem` AND `task` are "
+                "REQUIRED — a call that omits `task` fails without reaching "
+                "the solver. Solve one ALGORITHMIC puzzle with a "
                 "STARM model — a small recurrent solver that follows an "
                 "algorithm exactly, where an LLM guesses. "
                 "`task` is a STARM task id, spelled EXACTLY as one of: "

@@ -370,22 +370,28 @@ def test_starm_solve_posts_generate_and_returns_the_answer():
 
 
 @respx.mock
-def test_starm_solve_asks_the_server_which_task_it_serves():
-    """Task omitted: the server is the authority, so /info answers it."""
-    info = respx.get("http://localhost:8080/info").mock(
-        return_value=httpx.Response(
-            200, json={"task": "maze", "input_format": "grid of # and ."}
-        )
-    )
-    gen = respx.post("http://localhost:8080/generate").mock(
-        return_value=httpx.Response(
-            200, json={"output": "SSEE", "steps": 3, "max_steps": 8}
-        )
-    )
+def test_starm_solve_requires_the_task():
+    """`task` is not inferred: a planner that omits it gets told to name one.
+
+    It used to be filled in from the server's /info, which rewarded leaving
+    it out — and a planner that hasn't chosen a solver usually hasn't
+    encoded the puzzle for one either.
+    """
+    info = respx.get("http://localhost:8080/info")
     out = asyncio.run(_starm()("##..##"))
-    assert "SSEE" in out
-    assert info.call_count == 1
-    assert json.loads(gen.calls[0].request.content)["task"] == "maze"
+    assert "`task` is required" in out
+    assert info.call_count == 0  # answered before any network call
+    # The valid answers are named, so the retry can be right.
+    for task in ("sudoku", "maze", "arc", "arithmetic", "game_of_life"):
+        assert task in out
+
+
+def test_starm_solve_missing_task_lists_the_configured_tasks():
+    """With servers configured, only those are worth naming."""
+    out = asyncio.run(_starm(ports={"sudoku": 8080, "maze": 8081})("x"))
+    assert "`task` is required" in out
+    assert "maze" in out and "sudoku" in out
+    assert "arithmetic" not in out  # not served here
 
 
 @respx.mock
@@ -416,7 +422,7 @@ def test_starm_solve_empty_problem_quotes_the_servers_input_format():
             json={"task": "sudoku", "input_format": "81 cells, '.' for blanks"},
         )
     )
-    out = asyncio.run(_starm()("   "))
+    out = asyncio.run(_starm()("   ", task="sudoku"))
     assert "empty problem" in out
     assert "81 cells" in out
 
@@ -454,15 +460,6 @@ def test_starm_solve_unreachable_server_is_graceful():
     out = asyncio.run(_starm()("53...", task="sudoku"))
     assert "starm_solve error" in out
     assert "Is a STARM server running" in out
-
-
-@respx.mock
-def test_starm_solve_unreachable_server_when_asking_for_the_task():
-    respx.get("http://localhost:8080/info").mock(
-        side_effect=httpx.ConnectError("connection refused")
-    )
-    out = asyncio.run(_starm()("53..."))
-    assert "cannot reach a STARM server" in out
 
 
 @respx.mock
@@ -529,21 +526,10 @@ def test_starm_solve_unconfigured_task_lists_the_configured_ones():
     assert "maze" in out and "sudoku" in out
 
 
-@respx.mock
-def test_starm_solve_single_configured_server_needs_no_task():
-    route = respx.post("http://localhost:8080/generate").mock(
-        return_value=httpx.Response(200, json={"output": "9", "steps": 1, "max_steps": 2})
-    )
+def test_starm_solve_single_configured_server_still_needs_the_task():
+    """Even with one server, the task is stated rather than assumed."""
     out = asyncio.run(_starm(ports={"sudoku": 8080})("53..."))
-    assert "9" in out
-    # The task came from the map, so the server was never asked for it.
-    assert json.loads(route.calls[0].request.content)["task"] == "sudoku"
-
-
-def test_starm_solve_several_servers_ask_for_the_task():
-    out = asyncio.run(_starm(ports={"sudoku": 8080, "maze": 8081})("x"))
-    assert "name the one to use as `task`" in out
-    assert "maze" in out and "sudoku" in out
+    assert "`task` is required" in out
 
 
 @respx.mock
@@ -669,7 +655,8 @@ def test_starm_spec_forbids_prose_in_problem():
 def test_starm_solve_spec_documents_its_signature():
     by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
     description = by_name["starm_solve"]["description"]
-    assert "starm_solve(problem" in description
+    assert "starm_solve(problem: str, task: str" in description  # no default
+    assert "BOTH `problem` AND `task` are REQUIRED" in description
     assert "port" in description and "puzzle_id" in description
     assert "algorithmic" in by_name["starm_solve"]["tags"]
 
