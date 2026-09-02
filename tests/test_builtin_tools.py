@@ -672,6 +672,17 @@ def test_starm_spec_forbids_prose_in_problem():
     assert "bbb$ooo$bbb|1" in description  # encoded form shown against the prose one
 
 
+def test_starm_spec_demands_the_users_numbers_inside_problem():
+    """Planners dropped the generation count: it reads as an aside in the
+    question, but there is no argument to carry it."""
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
+    description = by_name["starm_solve"]["description"]
+    assert "EVERY number the user states" in description
+    assert "nowhere else to put it" in description
+    # The incomplete form is named as such, next to the complete one.
+    assert "'bbb$ooo$bbb' alone is INCOMPLETE" in description
+
+
 def test_starm_solve_spec_documents_its_signature():
     by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
     description = by_name["starm_solve"]["description"]
