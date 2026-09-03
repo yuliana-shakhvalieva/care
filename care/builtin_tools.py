@@ -1201,7 +1201,9 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
                 "request — never search for the operators yourself. "
                 "`input_expression`: the expression in REVERSE POLISH (postfix) notation — single digits and operators "
                 "run together, no spaces — with '?' in place of EVERY operator to recover, then '=' and the "
-                "target value. Exactly one '=' and at least one '?'. Example: '34?5?=35'"
+                "target value. Each operator applies to the two values immediately before it, so '34+5*' unfolds as "
+                "(3+4)=7, then 7*5=35. Exactly one '=' and at least one '?'. Example: '34?5?=35', whose answer is "
+                "'+' then '*'."
             ),
             "tags": list(_TAGS_ALGORITHMIC),
         },

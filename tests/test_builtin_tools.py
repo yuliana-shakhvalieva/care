@@ -555,6 +555,9 @@ def test_starm_specs_document_the_problem_format():
     # that way, unlike the infix one in STARM's own input_help.
     assert "REVERSE POLISH" in arithmetic
     assert "'34?5?=35'" in arithmetic
+    # The notation is unfolded step by step: postfix is not a format a
+    # planner can be assumed to read off the name alone.
+    assert "'34+5*' unfolds as (3+4)=7, then 7*5=35" in arithmetic
     gol = by_name["solve_game_of_life"]["description"]
     assert "'bbb$ooo$bbb'" in gol  # the pattern; the tool adds the count
     assert "`input_pattern`: the starting pattern" in gol
