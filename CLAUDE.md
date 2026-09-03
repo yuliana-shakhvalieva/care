@@ -50,8 +50,8 @@ care/
 ├── memory.py              CareMemory facade over GigaEvoClient (stamps CareChainMetadata)
 ├── platform.py            CarePlatform facade for evolution
 ├── builtin_tools.py       Tools registered into every run context: web_search, fetch_url, http_request,
-│                          calculator, current_datetime, starm_solve, run_python
-│                          (gated by tools.enable_builtins)
+│                          calculator, current_datetime, run_python (gated by tools.enable_builtins)
+│                          + one solve_<task> per configured STARM server (tools.starm_ports)
 ├── tool_synthesis.py      Self-healing missing tools: disk cache → Memory → LLM-synthesise (sandboxed)
 ├── capability_priming.py  Tells MAGE about locally-installed skills/MCP/tools before planning
 ├── runtime/               ~70 adapters, one rule per file (upstream callback → Textual Message, etc.)

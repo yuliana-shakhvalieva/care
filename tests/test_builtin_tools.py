@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 
 import httpx
@@ -299,211 +300,183 @@ def test_http_request_success(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# starm_solve
+# STARM solvers
 # ---------------------------------------------------------------------------
 
 
-def _starm(host="http://localhost", ports=None, port=8080, timeout=5.0):
-    return builtin_tools._make_starm_solve(host, ports, port, timeout)
+class _StarmCfg:
+    """Duck-typed ToolsConfig with three STARM servers configured."""
+
+    starm_host = "http://localhost"
+    starm_ports = {"sudoku": 8081, "game_of_life": 8082, "arc": 8083}
+    starm_timeout = 5.0
+    enable_code_exec = False
 
 
-def test_starm_base_url_appends_the_call_port():
-    # The configured host carries no port; the per-call port picks the server.
-    assert (
-        builtin_tools._starm_base_url("http://gpu-01", 8081, 8080)
-        == "http://gpu-01:8081"
-    )
+def _solvers(cfg=None):
+    ctx = _StubCtx()
+    builtin_tools.register_builtin_tools(ctx, cfg or _StarmCfg(), CareConfig().sandbox)
+    return ctx
 
 
-def test_starm_base_url_defaults_and_normalises_scheme():
-    assert builtin_tools._starm_base_url("gpu-01", None, 8080) == "http://gpu-01:8080"
+def test_starm_registers_one_solver_per_configured_task():
+    ctx = _solvers()
+    assert {"solve_sudoku", "solve_game_of_life", "solve_arc"} <= set(ctx.registered)
+    assert "starm_solve" not in ctx.registered  # no generic entry point
+    assert "algorithmic" in ctx.tags["solve_sudoku"]
 
 
-def test_starm_base_url_call_port_overrides_one_in_the_host():
-    assert (
-        builtin_tools._starm_base_url("http://localhost:9000", 8081, 8080)
-        == "http://localhost:8081"
-    )
+def test_starm_registers_nothing_without_configured_servers():
+    """A solver with no server behind it would only mislead the planner."""
+    ctx = _solvers(CareConfig().tools)
+    assert not [name for name in ctx.registered if name.startswith("solve_")]
 
 
-def test_starm_base_url_keeps_a_host_port_when_no_call_port():
-    assert (
-        builtin_tools._starm_base_url("http://localhost:9000", None, 8080)
-        == "http://localhost:9000"
-    )
-
-
-def test_coerce_port():
-    assert builtin_tools._coerce_port("8081") == 8081
-    assert builtin_tools._coerce_port(8081) == 8081
-    assert builtin_tools._coerce_port("nope") is None
-    assert builtin_tools._coerce_port(0) is None
-    assert builtin_tools._coerce_port(70000) is None
-
-
-def test_starm_solve_rejects_a_bad_port():
-    out = asyncio.run(_starm()("53 puzzle", task_id="sudoku", port="eight"))
-    assert "not a valid TCP port" in out
+def test_starm_solver_signatures():
+    ctx = _solvers()
+    assert list(inspect.signature(ctx.registered["solve_sudoku"]).parameters) == [
+        "problem"
+    ]
+    # ARC selects a learned puzzle embedding, so its id is a real argument.
+    assert list(inspect.signature(ctx.registered["solve_arc"]).parameters) == [
+        "input_grid",
+        "puzzle_id",
+    ]
+    # The evolution count is an argument, not punctuation in the pattern.
+    assert list(inspect.signature(ctx.registered["solve_game_of_life"]).parameters) == [
+        "input_pattern",
+        "evolutions",
+    ]
 
 
 @respx.mock
-def test_starm_solve_posts_generate_and_returns_the_answer():
+def test_starm_solver_posts_to_its_own_port():
     route = respx.post("http://localhost:8081/generate").mock(
         return_value=httpx.Response(
-            200,
-            json={
-                "task": "sudoku",
-                "input": "53...",
-                "output": "534678912",
-                "steps": 12,
-                "max_steps": 16,
-                "puzzle_id": None,
-            },
+            200, json={"output": "534678912", "steps": 12, "max_steps": 16}
         )
     )
-    out = asyncio.run(_starm()("53...", task_id="sudoku", port=8081))
+    out = asyncio.run(_solvers().registered["solve_sudoku"]("53..."))
     assert "534678912" in out
     assert "12/16" in out  # the ACT step count is carried through
-    assert route.call_count == 1
-    body = json.loads(route.calls[0].request.content)
-    assert body == {"task": "sudoku", "input": "53..."}  # no puzzle_id for non-ARC
+    assert json.loads(route.calls[0].request.content) == {
+        "task": "sudoku",
+        "input": "53...",
+    }
+
+
+@respx.mock
+def test_starm_solvers_do_not_share_a_port():
+    """Each task has its own server; the tool name picks it."""
+    respx.post("http://localhost:8082/generate").mock(
+        return_value=httpx.Response(
+            200, json={"output": "bob$bob$bob", "steps": 2, "max_steps": 8}
+        )
+    )
+    out = asyncio.run(_solvers().registered["solve_game_of_life"]("bbb$ooo$bbb", 1))
+    assert "bob$bob$bob" in out
+
+
+@respx.mock
+def test_game_of_life_joins_the_pattern_and_the_step_count():
+    """`evolutions` is its own argument because planners forget a '|N'
+    suffix; the tool is what builds the string the server parses."""
+    route = respx.post("http://localhost:8082/generate").mock(
+        return_value=httpx.Response(200, json={"output": "bob$bob$bob"})
+    )
+    gol = _solvers().registered["solve_game_of_life"]
+    asyncio.run(gol("bbb$ooo$bbb", 1))
+    assert json.loads(route.calls[0].request.content)["input"] == "bbb$ooo$bbb|1"
+    # Planners routinely pass numbers as strings.
+    asyncio.run(gol("bbb$ooo$bbb", "3"))
+    assert json.loads(route.calls[1].request.content)["input"] == "bbb$ooo$bbb|3"
 
 
 @respx.mock(assert_all_called=False)
-def test_starm_solve_blank_task_id_names_the_valid_ids(respx_mock):
-    """An empty string still reaches the body — answer it before the network."""
-    out = asyncio.run(_starm()("##..##", task_id="  "))
-    assert "`task_id` is required" in out
-    assert not respx_mock.calls  # answered without touching the network
-    for task in ("sudoku", "maze", "arc", "arithmetic", "game_of_life"):
-        assert task in out
-
-
-def test_starm_solve_blank_task_id_lists_the_configured_tasks():
-    """With servers configured, only those are worth naming."""
-    out = asyncio.run(_starm(ports={"sudoku": 8080, "maze": 8081})("x", task_id=""))
-    assert "`task_id` is required" in out
-    assert "maze" in out and "sudoku" in out
-    assert "arithmetic" not in out  # not served here
+def test_game_of_life_rejects_an_unusable_evolution_count(respx_mock):
+    gol = _solvers().registered["solve_game_of_life"]
+    assert "whole number" in asyncio.run(gol("bbb$ooo$bbb", "once"))
+    assert "cannot be negative" in asyncio.run(gol("bbb$ooo$bbb", -1))
+    assert not respx_mock.calls  # neither reaches the server
 
 
 @respx.mock
-def test_starm_solve_forwards_puzzle_id_for_arc():
-    route = respx.post("http://localhost:8080/generate").mock(
-        return_value=httpx.Response(200, json={"output": "0 1", "steps": 2, "max_steps": 8})
+def test_starm_arc_forwards_the_puzzle_id():
+    route = respx.post("http://localhost:8083/generate").mock(
+        return_value=httpx.Response(200, json={"output": "0 1", "steps": 1, "max_steps": 4})
     )
-    asyncio.run(_starm()("0 0\n1 1", task_id="arc", puzzle_id="007bbfb7"))
+    asyncio.run(_solvers().registered["solve_arc"]("0 0", "007bbfb7"))
     assert json.loads(route.calls[0].request.content)["puzzle_id"] == "007bbfb7"
 
 
+@respx.mock(assert_all_called=False)
+def test_starm_solver_empty_problem_costs_no_request(respx_mock):
+    out = asyncio.run(_solvers().registered["solve_sudoku"]("   "))
+    assert "`input_grid`" in out  # the message names this tool's own argument
+    assert not respx_mock.calls
+
+
 @respx.mock
-def test_starm_solve_unreachable_server_is_graceful():
-    respx.post("http://localhost:8080/generate").mock(
+def test_starm_solver_unreachable_server_is_graceful():
+    respx.post("http://localhost:8081/generate").mock(
         side_effect=httpx.ConnectError("connection refused")
     )
-    out = asyncio.run(_starm()("53...", task_id="sudoku"))
-    assert "starm_solve error" in out
+    out = asyncio.run(_solvers().registered["solve_sudoku"]("53..."))
+    assert "solve_sudoku error" in out
     assert "Is a STARM server running" in out
 
 
 @respx.mock
-def test_starm_solve_empty_output_is_reported():
-    respx.post("http://localhost:8080/generate").mock(
-        return_value=httpx.Response(200, json={"output": "  ", "steps": 1, "max_steps": 4})
+def test_starm_solver_relays_the_servers_rejection():
+    """STARM owns the prompt format, so its 422 text is the answer."""
+    respx.post("http://localhost:8081/generate").mock(
+        return_value=httpx.Response(422, json={"detail": "81 cells expected, got 12"})
     )
-    out = asyncio.run(_starm()("x", task_id="sudoku"))
+    out = asyncio.run(_solvers().registered["solve_sudoku"]("53"))
+    assert "81 cells expected, got 12" in out
+
+
+@respx.mock
+def test_starm_solver_empty_answer_is_reported():
+    respx.post("http://localhost:8081/generate").mock(
+        return_value=httpx.Response(200, json={"output": "  "})
+    )
+    out = asyncio.run(_solvers().registered["solve_sudoku"]("x"))
     assert "empty answer" in out
 
 
 @respx.mock
-def test_starm_solve_honours_the_configured_host():
+def test_starm_solver_honours_a_remote_host():
+    cfg = _StarmCfg()
+    cfg.starm_host = "http://gpu-01"
     respx.post("http://gpu-01:8081/generate").mock(
         return_value=httpx.Response(200, json={"output": "ok", "steps": 1, "max_steps": 2})
     )
-    out = asyncio.run(_starm(host="http://gpu-01")("x", task_id="sudoku", port=8081))
-    assert "ok" in out
+    assert "ok" in asyncio.run(_solvers(cfg).registered["solve_sudoku"]("x"))
 
 
-def test_starm_solve_registered_with_config_values():
-    """The registered tool is bound to the config, not to hardcoded defaults."""
-    cfg = CareConfig()
-    cfg.tools.starm_host = "http://gpu-02"
-    cfg.tools.starm_port = 9100
-    ctx = _StubCtx()
-    builtin_tools.register_builtin_tools(ctx, cfg.tools, cfg.sandbox)
-    with respx.mock:
-        route = respx.post("http://gpu-02:9100/generate").mock(
-            return_value=httpx.Response(
-                200, json={"output": "bound", "steps": 1, "max_steps": 2}
-            )
-        )
-        out = asyncio.run(ctx.registered["starm_solve"]("x", task_id="sudoku"))
-    assert "bound" in out and route.call_count == 1
-
-
-@respx.mock
-def test_starm_solve_takes_the_port_from_the_task_map():
-    """The deployment knows the port; the prompt only names the task."""
-    route = respx.post("http://localhost:8081/generate").mock(
-        return_value=httpx.Response(
-            200, json={"output": "SSEE", "steps": 3, "max_steps": 8}
-        )
+def test_starm_base_url_composition():
+    assert builtin_tools._starm_base_url("http://gpu-01", 8081) == "http://gpu-01:8081"
+    assert builtin_tools._starm_base_url("gpu-01", 8080) == "http://gpu-01:8080"
+    # A port on the host loses to the task's own.
+    assert builtin_tools._starm_base_url("http://localhost:9000", 8081) == (
+        "http://localhost:8081"
     )
-    tool = _starm(ports={"sudoku": 8080, "maze": 8081})
-    out = asyncio.run(tool("##..##", task_id="maze"))
-    assert "SSEE" in out and route.call_count == 1
 
 
-@respx.mock
-def test_starm_solve_task_lookup_ignores_case_and_dashes():
-    respx.post("http://localhost:8082/generate").mock(
-        return_value=httpx.Response(200, json={"output": "o", "steps": 1, "max_steps": 2})
-    )
-    tool = _starm(ports={"game_of_life": 8082})
-    assert "o" in asyncio.run(tool("bbo$obb|3", task_id="Game-of-Life"))
+def test_starm_solver_ports_drops_unusable_entries():
+    class _Cfg:
+        starm_ports = {
+            "sudoku": 8081,
+            "chess": 9000,  # not a STARM task
+            "maze": "nope",  # not a port
+            "Game-Of-Life": 8082,  # spelling folded
+        }
 
-
-def test_starm_solve_unconfigured_task_lists_the_configured_ones():
-    tool = _starm(ports={"sudoku": 8080, "maze": 8081})
-    out = asyncio.run(tool("x", task_id="chess"))
-    assert "not a STARM task id" in out
-    assert "maze" in out and "sudoku" in out
-
-
-def test_starm_solve_rejects_a_description_in_task_id():
-    """The failure this rename exists for: `task` read as "what to do"."""
-    out = asyncio.run(_starm()("bbb$ooo$bbb|1", task_id="Compute next generation"))
-    assert "not a STARM task id" in out
-    assert "names WHICH solver to use" in out
-    assert "game_of_life" in out  # the answer it should have given
-
-
-def test_starm_solve_without_task_id_raises():
-    """No default: the step fails loudly instead of returning an
-    instruction that the next step could mistake for an answer."""
-    with pytest.raises(TypeError):
-        asyncio.run(_starm()("bbb$ooo$bbb|1"))
-
-
-def test_starm_solve_rejects_the_old_task_keyword():
-    """`task` was never shipped as a parameter — it reads as "what to do"."""
-    with pytest.raises(TypeError):
-        asyncio.run(_starm()("x", task="sudoku"))
-
-
-def test_starm_solve_single_configured_server_still_needs_the_task():
-    """Even with one server, the task is stated rather than assumed."""
-    out = asyncio.run(_starm(ports={"sudoku": 8080})("53...", task_id=""))
-    assert "`task_id` is required" in out
-
-
-@respx.mock
-def test_starm_solve_explicit_port_overrides_the_map():
-    respx.post("http://localhost:9999/generate").mock(
-        return_value=httpx.Response(200, json={"output": "ok", "steps": 1, "max_steps": 2})
-    )
-    tool = _starm(ports={"sudoku": 8080})
-    assert "ok" in asyncio.run(tool("x", task_id="sudoku", port=9999))
+    assert builtin_tools.starm_solver_ports(_Cfg()) == {
+        "sudoku": 8081,
+        "game_of_life": 8082,
+    }
 
 
 def test_starm_ports_parse_from_an_env_style_string():
@@ -516,39 +489,97 @@ def test_starm_ports_parse_from_json():
     assert cfg.tools.starm_ports == {"arc": 8083}
 
 
-def test_starm_ports_drop_unusable_entries_instead_of_crashing():
-    cfg = CareConfig(tools={"starm_ports": "sudoku=8080,maze=nope,arc=99999"})
-    assert cfg.tools.starm_ports == {"sudoku": 8080}
-
-
 def test_starm_ports_empty_by_default():
     assert CareConfig().tools.starm_ports == {}
 
 
-def test_starm_spec_never_probes_a_server():
-    """Building the description is offline — no /info, no network at all."""
-    with respx.mock(assert_all_called=False) as mock:
-        cfg = CareConfig()
-        cfg.tools.starm_ports = {"sudoku": 8080, "maze": 8081}
-        builtin_tools.builtin_tool_specs(cfg.tools)
-        assert not mock.calls
+def test_starm_specs_are_advertised_per_task():
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(_StarmCfg())}
+    assert {"solve_sudoku", "solve_game_of_life", "solve_arc"} <= set(by_name)
+    sudoku = by_name["solve_sudoku"]["description"]
+    assert sudoku.startswith("solve_sudoku(input_grid: str) -> str.")
+    assert "task_id" not in sudoku  # the solver is chosen by tool name
+    arc = by_name["solve_arc"]["description"]
+    assert "puzzle_id" in arc
+    # Rows go in separated by '<eos>', and the example shows exactly that.
+    assert "'000<eos>010<eos>000'" in arc
 
 
-def test_starm_spec_lists_the_task_ids():
-    """A planner can't guess 'game_of_life' from prose about Life."""
-    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
-    description = by_name["starm_solve"]["description"]
-    for task in ("sudoku", "maze", "arc", "arithmetic", "game_of_life"):
-        assert f"`{task}`" in description, task
+def test_every_starm_spec_matches_its_solver():
+    """The hand-written specs and the registered callables must agree:
+    one spec per task, same name, and a signature the description documents."""
+
+    class _AllTasks:
+        starm_host = "http://localhost"
+        starm_timeout = 5.0
+        enable_code_exec = False
+        starm_ports = {
+            task: 8000 + i
+            for i, task in enumerate(builtin_tools._STARM_TASK_IDS)
+        }
+
+    cfg = _AllTasks()
+    ctx = _StubCtx()
+    builtin_tools.register_builtin_tools(ctx, cfg, CareConfig().sandbox)
+    specs = {s["name"]: s for s in builtin_tools.builtin_tool_specs(cfg)}
+
+    for task_id in builtin_tools._STARM_TASK_IDS:
+        name = f"solve_{task_id}"
+        assert name in ctx.registered, name
+        assert name in specs, name
+        params = list(inspect.signature(ctx.registered[name]).parameters)
+        head = specs[name]["description"].split(" -> str.")[0]
+        assert head.startswith(f"{name}("), name
+        for param in params:  # every argument is documented in the signature
+            assert param in head, (name, param)
+        assert specs[name]["source"] == "care:builtin"
+        assert specs[name]["tags"]
 
 
-def test_starm_solve_spec_documents_its_signature():
-    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs()}
-    description = by_name["starm_solve"]["description"]
-    assert "starm_solve(problem: str, task_id: str," in description  # no default
-    assert "BOTH `problem` AND `task_id` are REQUIRED" in description
-    assert "port" in description and "puzzle_id" in description
-    assert "algorithmic" in by_name["starm_solve"]["tags"]
+def test_starm_specs_never_mention_the_engine():
+    """The planner picks a tool by what it does; the backend is CARE's
+    business, and naming it only spends context."""
+    for spec in builtin_tools.builtin_tool_specs(_StarmCfg()):
+        if spec["name"].startswith("solve_"):
+            assert "starm" not in spec["description"].lower(), spec["name"]
+
+
+def test_starm_specs_document_the_problem_format():
+    """Each solver states its own encoding — that's what stops a planner
+    passing the user's sentence through."""
+    by_name = {s["name"]: s for s in builtin_tools.builtin_tool_specs(_StarmCfg())}
+    assert "81 cells" in by_name["solve_sudoku"]["description"]
+    assert "'#' a wall" in by_name["solve_maze"]["description"]
+    arithmetic = by_name["solve_arithmetic"]["description"]
+    # Postfix, per the dataset builder's evaluate_rpn — the example must parse
+    # that way, unlike the infix one in STARM's own input_help.
+    assert "REVERSE POLISH" in arithmetic
+    assert "'34?5?=35'" in arithmetic
+    gol = by_name["solve_game_of_life"]["description"]
+    assert "'bbb$ooo$bbb'" in gol  # the pattern; the tool adds the count
+    assert "`input_pattern`: the starting pattern" in gol
+    assert "`evolutions`: after how many evolutions" in gol
+
+
+def test_every_starm_spec_carries_an_example():
+    """A format described in prose still gets guessed at; a worked example
+    is what a planner copies."""
+    class _AllTasks:
+        starm_host = "http://localhost"
+        starm_timeout = 5.0
+        starm_ports = {
+            task: 8000 + i
+            for i, task in enumerate(builtin_tools._STARM_TASK_IDS)
+        }
+
+    for spec in builtin_tools.builtin_tool_specs(_AllTasks()):
+        if spec["name"].startswith("solve_"):
+            assert "Example" in spec["description"], spec["name"]
+
+
+def test_starm_specs_absent_without_configured_servers():
+    names = {s["name"] for s in builtin_tools.builtin_tool_specs()}
+    assert not [n for n in names if n.startswith("solve_")]
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +620,6 @@ _EXPECTED = {
     "http_request",
     "calculator",
     "current_datetime",
-    "starm_solve",
     "run_python",
 }
 

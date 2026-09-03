@@ -356,8 +356,8 @@ class ToolsConfig(BaseModel):
 
     enable_builtins: bool = True
     """Register CARE's bundled standard tools (``web_search``,
-    ``fetch_url``, ``calculator``, ``current_datetime``,
-    ``starm_solve``) into every
+    ``fetch_url``, ``calculator``, ``current_datetime``, the STARM
+    ``solve_<task>`` solvers) into every
     execution context so MAGE-generated chains that reference them can
     actually run. Set ``False`` to ship a fully bring-your-own-tools
     deployment. See :mod:`care.builtin_tools`."""
@@ -509,21 +509,21 @@ class ToolsConfig(BaseModel):
     before it's re-verified on next use. ``0`` re-verifies on every use."""
 
     starm_host: str = "http://localhost"
-    """Where STARM inference servers live, WITHOUT a port — the
-    ``starm_solve`` builtin appends the per-call port. STARM serves one
-    checkpoint (= one task) per process, so a multi-GPU box runs several
-    on neighbouring ports; the host is what they share. Point this at a
-    remote box (``http://gpu-01``) when the servers aren't local."""
+    """Where STARM inference servers live, WITHOUT a port — each solver
+    appends its task's port from :attr:`starm_ports`. STARM serves one
+    checkpoint (= one task) per process, so a multi-GPU box runs several on
+    neighbouring ports; the host is what they share. Point this at a remote
+    box (``http://gpu-01``) when the servers aren't local."""
 
     starm_ports: dict[str, int] = Field(default_factory=dict)
     """Which STARM server serves which task — ``{"sudoku": 8080, "maze":
-    8081}``. This is deployment wiring, not something a user should have to
-    say in a prompt: a chain names the *task* and ``starm_solve`` looks the
-    port up here. Configure under ``[tools.starm_ports]`` in TOML, or as
+    8081}``. CARE registers one solver tool per entry (``solve_sudoku``,
+    ``solve_maze``, …), so this list decides which STARM tools exist at all;
+    empty means none. Tasks are STARM's own ids: ``sudoku``, ``maze``,
+    ``arc``, ``arithmetic``, ``game_of_life``. Configure under
+    ``[tools.starm_ports]`` in TOML, or as
     ``CARE_TOOLS__STARM_PORTS=sudoku=8080,maze=8081`` (a JSON object is
-    accepted too). Keys are matched loosely (case and ``-``/``_`` are
-    ignored) so ``game-of-life`` finds ``game_of_life``. Empty (the
-    default) falls back to :attr:`starm_port`."""
+    accepted too)."""
 
     @field_validator("starm_ports", mode="before")
     @classmethod
@@ -563,13 +563,8 @@ class ToolsConfig(BaseModel):
                 out[str(name).strip()] = number
         return out
 
-    starm_port: int = Field(default=8080, ge=1, le=65535)
-    """Port ``starm_solve`` falls back to when the task isn't in
-    :attr:`starm_ports` and the caller named none. Matches ``host_model``'s
-    own default."""
-
     starm_timeout: float = Field(default=120.0, gt=0)
-    """Wall-clock seconds a single ``starm_solve`` HTTP call may take.
+    """Wall-clock seconds a single STARM solver call may take.
     Generous by default: STARM's recursion runs up to ``halt_max_steps``
     passes, and a cold server also has to load its checkpoint."""
 

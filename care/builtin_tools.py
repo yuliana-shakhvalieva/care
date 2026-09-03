@@ -89,11 +89,11 @@ def _bias_recency(query: str) -> str:
 
 
 def _make_web_search(
-    provider: str,
-    api_key: str | None,
-    max_results: int,
-    *,
-    provider_keys: dict[str, str] | None = None,
+        provider: str,
+        api_key: str | None,
+        max_results: int,
+        *,
+        provider_keys: dict[str, str] | None = None,
 ) -> Callable[..., Any]:
     """Build the ``web_search`` callable bound to a provider + key(s).
 
@@ -150,10 +150,10 @@ def _make_web_search(
 
 
 async def _search(
-    provider: str,
-    api_key: str,
-    query: str,
-    max_results: int,
+        provider: str,
+        api_key: str,
+        query: str,
+        max_results: int,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Dispatch ONE search to ``provider``.
 
@@ -212,9 +212,9 @@ async def _search(
             # Serper surfaces a direct answer in answerBox / knowledgeGraph.
             box = data.get("answerBox") or {}
             answer = (
-                box.get("answer")
-                or box.get("snippet")
-                or (data.get("knowledgeGraph") or {}).get("description")
+                    box.get("answer")
+                    or box.get("snippet")
+                    or (data.get("knowledgeGraph") or {}).get("description")
             )
             return answer, [
                 {
@@ -296,7 +296,7 @@ async def _search(
 
 
 async def _search_duckduckgo(
-    query: str, max_results: int
+        query: str, max_results: int
 ) -> list[dict[str, Any]]:
     """Keyless DuckDuckGo search via the ``ddgs`` library — the universal
     fallback (no API key needed). ``ddgs`` is synchronous, so it runs in a
@@ -345,13 +345,13 @@ def _is_transient(exc: Exception) -> bool:
 
 
 async def _search_resilient(
-    provider: str,
-    api_key: str | None,
-    query: str,
-    max_results: int,
-    *,
-    provider_keys: dict[str, str] | None = None,
-    sleep: Callable[[float], Any] | None = None,
+        provider: str,
+        api_key: str | None,
+        query: str,
+        max_results: int,
+        *,
+        provider_keys: dict[str, str] | None = None,
+        sleep: Callable[[float], Any] | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Run :func:`_search` with retry + provider fallback.
 
@@ -382,7 +382,7 @@ async def _search_resilient(
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 if _is_transient(exc) and attempt < _WEB_SEARCH_RETRIES - 1:
-                    await sleep(_WEB_SEARCH_BACKOFF_BASE * (2**attempt))
+                    await sleep(_WEB_SEARCH_BACKOFF_BASE * (2 ** attempt))
                     continue
                 break  # non-transient or out of retries — try next provider
             if answer or results:
@@ -433,7 +433,7 @@ def _make_fetch_url(max_chars: int) -> Callable[..., Any]:
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0), follow_redirects=True
+                    timeout=httpx.Timeout(30.0), follow_redirects=True
             ) as client:
                 resp = await client.get(
                     u, headers={"User-Agent": "care-agent/1.0 (+fetch_url)"}
@@ -479,12 +479,12 @@ def _make_http_request(max_chars: int) -> Callable[..., Any]:
     """Build ``http_request`` bound to an output-size cap."""
 
     async def http_request(
-        url: str,
-        method: str = "GET",
-        headers: Any = None,
-        params: Any = None,
-        json_body: Any = None,
-        data: Any = None,
+            url: str,
+            method: str = "GET",
+            headers: Any = None,
+            params: Any = None,
+            json_body: Any = None,
+            data: Any = None,
     ) -> str:
         """Make an HTTP request to any API; returns status + response body."""
         u = str(url or "").strip()
@@ -507,7 +507,7 @@ def _make_http_request(max_chars: int) -> Callable[..., Any]:
             kwargs["content"] = data if isinstance(data, (bytes, str)) else str(data)
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0), follow_redirects=True
+                    timeout=httpx.Timeout(30.0), follow_redirects=True
             ) as client:
                 resp = await client.request(verb, u, **kwargs)
         except Exception as exc:  # noqa: BLE001
@@ -531,9 +531,9 @@ def _make_http_request(max_chars: int) -> Callable[..., Any]:
 
 
 def _make_run_python(
-    sandbox_cfg: Any,
-    timeout: int,
-    max_chars: int,
+        sandbox_cfg: Any,
+        timeout: int,
+        max_chars: int,
 ) -> Callable[..., Any]:
     """Build ``run_python`` bound to a Docker sandbox config.
 
@@ -544,6 +544,7 @@ def _make_run_python(
     and returned. Network egress is allowed unless the sandbox policy is
     ``none`` (generated tools usually need to call an API).
     """
+
     async def run_python(code: str) -> str:
         """Execute Python source in the sandbox; return stdout+stderr."""
         src = str(code or "")
@@ -557,11 +558,11 @@ def _make_run_python(
 
 
 async def run_python_source(
-    source: str,
-    sandbox_cfg: Any,
-    *,
-    timeout: int = 60,
-    max_chars: int = 4000,
+        source: str,
+        sandbox_cfg: Any,
+        *,
+        timeout: int = 60,
+        max_chars: int = 4000,
 ) -> str:
     """Run ``source`` in a one-shot Docker sandbox; return stdout+stderr.
 
@@ -650,14 +651,26 @@ async def _force_remove_container(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# starm_solve — one HTTP call to a STARM inference server
+# STARM solvers — one tool per task, each a single call to its own server
 # ---------------------------------------------------------------------------
+
+#: STARM's task ids, as its tokenizer registry spells them. One server serves
+#: one of these; CARE registers ``solve_<task>`` for each one configured in
+#: ``tools.starm_ports``, so a planner picks a solver by NAME instead of
+#: passing an identifier it can get wrong.
+_STARM_TASK_IDS: tuple[str, ...] = (
+    "sudoku",
+    "maze",
+    "arc",
+    "arithmetic",
+    "game_of_life",
+)
 
 
 def _coerce_port(value: Any) -> int | None:
-    """Parse a port out of whatever the planner passed. ``None`` when it
-    isn't a usable TCP port, so the caller can say so instead of quietly
-    talking to the wrong server."""
+    """Parse a port out of a config value. ``None`` when it isn't a usable
+    TCP port, so the caller can say so instead of talking to the wrong
+    server."""
     try:
         port = int(str(value).strip())
     except (TypeError, ValueError):
@@ -665,27 +678,25 @@ def _coerce_port(value: Any) -> int | None:
     return port if 0 < port < 65536 else None
 
 
-def _starm_base_url(host: str, port: int | None, default_port: int) -> str:
-    """Compose a STARM server's base URL from the configured host + a port.
+def _starm_base_url(host: str, port: int) -> str:
+    """Compose a STARM server's base URL from the configured host + its port.
 
     ``CareConfig.tools.starm_host`` carries no port by convention: one STARM
-    process serves one checkpoint (= one task), so a box runs several of them
-    on neighbouring ports and only the port varies per call. A host that DOES
-    carry a port is still honoured — an explicit ``port`` argument overrides
-    it, otherwise it stands.
+    process serves one checkpoint, so a box runs several on neighbouring
+    ports and only the port varies per task. A host that DOES carry one is
+    overridden by the task's own.
     """
     raw = str(host or "").strip() or "http://localhost"
     if "://" not in raw:
         raw = "http://" + raw
     parts = urlsplit(raw)
-    resolved = port or parts.port or default_port
     hostname = parts.hostname or "localhost"
     if ":" in hostname:  # IPv6 literal — urlsplit strips the brackets
         hostname = f"[{hostname}]"
     return urlunsplit(
         (
             parts.scheme or "http",
-            f"{hostname}:{resolved}",
+            f"{hostname}:{port}",
             parts.path.rstrip("/"),
             "",
             "",
@@ -697,9 +708,8 @@ def _starm_detail(response: Any) -> str:
     """Best-effort human text out of a STARM error response.
 
     ``/generate`` answers 4xx with ``{"detail": ...}`` — a string for a
-    tokenizer/routing error, a list of Pydantic error dicts for a malformed
-    body. Both are worth showing verbatim: they are the server's own
-    diagnosis of the prompt.
+    tokenizer error, a list of Pydantic error dicts for a malformed body.
+    Both are the server's own diagnosis and are shown verbatim.
     """
     try:
         detail = response.json().get("detail")
@@ -712,148 +722,182 @@ def _starm_detail(response: Any) -> str:
     return str(detail)
 
 
-def _starm_task_key(task: str) -> str:
-    """Fold a task name for port lookup, so ``Game-of-Life`` matches the
-    ``game_of_life`` a config was written with. Only the *lookup* is
-    lenient — whatever the caller spelled is what goes to the server, whose
-    own 422 is the authority on a name it doesn't serve."""
-    return str(task or "").strip().lower().replace("-", "_")
-
-
-#: STARM's task ids, as its tokenizer registry spells them. Named here so a
-#: call with no `task` can say what the valid answers are; the server stays
-#: the authority on what IT serves (an unknown name comes back as its 422).
-_STARM_TASK_IDS: tuple[str, ...] = (
-    "sudoku",
-    "maze",
-    "arc",
-    "arithmetic",
-    "game_of_life",
-)
-
-def _make_starm_solve(
-    host: str,
-    ports: dict[str, int] | None,
-    default_port: int,
-    timeout: float,
-) -> Callable[..., Any]:
-    """Build ``starm_solve`` bound to the configured STARM deployment.
-
-    STARM (Single Task Algorithmic Reasoning Models) serves one trained
-    checkpoint per process over a small HTTP API: ``GET /info`` describes the
-    task it serves and the text format that task's prompts take, and
-    ``POST /generate`` answers one. This tool is only that call — the task
-    list, the prompt formats, the ARC puzzle-id resolution and the answer
-    decoding all stay on the server, which is the only place they are
-    correct for a given checkpoint.
-
-    ``ports`` maps task -> port (``CareConfig.tools.starm_ports``). Which
-    port a task lives on is a property of the deployment, not of the
-    question, so a chain names the task and the port is looked up here — no
-    user should have to type ``8080`` into a prompt.
-    """
-    port_map = {_starm_task_key(k): v for k, v in (ports or {}).items()}
-
-    async def starm_solve(
-        problem: str,
+async def _starm_generate(
+        *,
+        tool: str,
         task_id: str,
-        port: Any = None,
-        puzzle_id: Any = None,
-    ) -> str:
-        """Solve an algorithmic puzzle with a STARM model; returns its answer."""
-        import httpx
+        base: str,
+        problem: str,
+        argument: str = "input_problem",
+        puzzle_id: str = "",
+        timeout: float,
+) -> str:
+    """POST one puzzle to a STARM server and return its answer.
 
-        text = str(problem or "").strip()
-        served = str(task_id or "").strip()
-        pid = str(puzzle_id or "").strip()
+    The single HTTP call every solver shares. STARM owns the prompt format,
+    its validation and the answer decoding; this only carries the request and
+    relays what comes back, including the server's own rejection text.
+    """
+    import httpx
 
-        known = ", ".join(sorted(port_map)) if port_map else ", ".join(_STARM_TASK_IDS)
+    text = str(problem or "").strip()
+    if not text:
+        return f"{tool}: nothing to solve — pass the puzzle as `{argument}`."
 
-        # `task_id` is required, not inferred. It used to be filled in from
-        # the server's /info when omitted, which quietly rewarded a planner
-        # for leaving it out — and a planner that leaves it out has usually
-        # not decided WHICH solver it wants, so the next thing it gets wrong
-        # is the encoding. Demanding it keeps the choice explicit.
-        if not served:
-            return (
-                "starm_solve: `task_id` is required — name the STARM task this "
-                f"puzzle belongs to. Available: {known}."
-            )
-
-        # Reject a description before spending a request on it. A planner
-        # that wrote "Compute next generation" here has misread the field,
-        # and the fix it needs is the list of ids, not a 422 about a task
-        # the server never heard of.
-        valid = set(port_map) if port_map else set(_STARM_TASK_IDS)
-        if _starm_task_key(served) not in valid:
-            return (
-                f"starm_solve: {served!r} is not a STARM task id. `task_id` "
-                "names WHICH solver to use, not what to do with the puzzle — "
-                f"pass exactly one of: {known}."
-            )
-
-        resolved_port: int | None = None
-        if port not in (None, ""):
-            # An explicit port always wins — it's the escape hatch for a
-            # server that isn't in the config yet.
-            resolved_port = _coerce_port(port)
-            if resolved_port is None:
-                return (
-                    f"starm_solve: {port!r} is not a valid TCP port — pass the "
-                    "port the STARM server for this task listens on."
-                )
-        elif port_map:
-            # Safe: an id outside the map was already rejected above, so the
-            # lookup cannot miss.
-            resolved_port = port_map[_starm_task_key(served)]
-
-        base = _starm_base_url(host, resolved_port, default_port)
-
-        if not text:
-            return "starm_solve: empty problem — pass the puzzle as `problem`."
-
+    payload: dict[str, Any] = {"task": task_id, "input": text}
+    if puzzle_id:
+        payload["puzzle_id"] = puzzle_id
+    try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-            payload: dict[str, Any] = {"task": served, "input": text}
-            if pid:
-                payload["puzzle_id"] = pid
+            resp = await client.post(f"{base}/generate", json=payload)
+    except Exception as exc:  # noqa: BLE001 — surface, don't abort the step
+        _log.warning("%s POST %s/generate failed: %s", tool, base, exc)
+        return (
+            f"{tool} error (POST {base}/generate): {exc}. "
+            "Is a STARM server running on that port?"
+        )
+
+    if resp.status_code >= 400:
+        return (
+            f"{tool}: {base} rejected the request "
+            f"(HTTP {resp.status_code}): {_starm_detail(resp)}"
+        )
+
+    try:
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        return f"{tool} error: {base} returned a non-JSON body: {exc}"
+    if not isinstance(data, dict):
+        return f"{tool} error: unexpected response shape from {base}"
+
+    output = str(data.get("output", "")).strip()
+    if not output:
+        return f"{tool}: {base} returned an empty answer."
+    steps, max_steps = data.get("steps"), data.get("max_steps")
+    trace = (
+        f" in {steps}/{max_steps} recursion steps"
+        if steps is not None and max_steps is not None
+        else ""
+    )
+    return f"STARM {task_id!r}{trace}:\n{output}"
+
+
+def _make_starm_solver(
+        task_id: str, host: str, port: int, timeout: float
+) -> Callable[..., Any]:
+    """Build the solver for one task, bound to its server.
+
+    One function per task rather than one generic wrapper: each names its
+    argument after what that puzzle actually is (``input_grid``,
+    ``input_maze``, …), which is the strongest hint a planner gets — a
+    parameter called ``problem`` invites the user's question instead of the
+    puzzle. ARC and Game of Life also take a second argument of their own.
+    """
+    tool = f"solve_{task_id}"
+    base = _starm_base_url(host, port)
+
+    # Named per task so the empty-input message points at the right argument.
+    argument = {
+        "sudoku": "input_grid",
+        "maze": "input_maze",
+        "arithmetic": "input_expression",
+        "arc": "input_grid",
+        "game_of_life": "input_pattern",
+    }.get(task_id, "input_problem")
+
+    async def send(problem: str, puzzle_id: str = "") -> str:
+        return await _starm_generate(
+            tool=tool,
+            task_id=task_id,
+            base=base,
+            problem=problem,
+            argument=argument,
+            puzzle_id=puzzle_id,
+            timeout=timeout,
+        )
+
+    if task_id == "sudoku":
+
+        async def solver(input_grid: str) -> str:
+            """Fill in a sudoku grid."""
+            return await send(input_grid)
+
+    elif task_id == "maze":
+
+        async def solver(input_maze: str) -> str:  # type: ignore[misc]
+            """Find the shortest path through a maze."""
+            return await send(input_maze)
+
+    elif task_id == "arithmetic":
+
+        async def solver(input_expression: str) -> str:  # type: ignore[misc]
+            """Recover the masked operators of an expression."""
+            return await send(input_expression)
+
+    elif task_id == "arc":
+
+        async def solver(input_grid: str, puzzle_id: str) -> str:  # type: ignore[misc]
+            """Apply an ARC-AGI task's transformation to a grid.
+
+            The checkpoint keeps what it knows about a task in a learned
+            puzzle embedding, so the server needs the task's id to select
+            one — a grid alone doesn't say which task it belongs to.
+            """
+            return await send(input_grid, str(puzzle_id or "").strip())
+
+    elif task_id == "game_of_life":
+
+        async def solver(input_pattern: str, evolutions: int) -> str:  # type: ignore[misc]
+            """Predict a Life pattern after ``evolutions`` evolutions."""
+            # The server takes one string, "<pattern>|<evolutions>". The count
+            # is asked for as its own argument rather than as punctuation
+            # inside the pattern: a planner reliably fills a named parameter
+            # and just as reliably forgets a '|N' suffix.
             try:
-                resp = await client.post(f"{base}/generate", json=payload)
-            except Exception as exc:  # noqa: BLE001 — surface, don't abort the step
-                _log.warning("starm_solve POST %s/generate failed: %s", base, exc)
+                count = int(str(evolutions).strip())
+            except (TypeError, ValueError):
                 return (
-                    f"starm_solve error (POST {base}/generate): {exc}. "
-                    "Is a STARM server running on that port?"
+                    "solve_game_of_life: `evolutions` must be a whole number, "
+                    f"got {evolutions!r}."
                 )
+            if count < 0:
+                return "solve_game_of_life: `evolutions` cannot be negative."
+            pattern = str(input_pattern or "").strip()
+            return await send(f"{pattern}|{count}" if pattern else "")
 
-            if resp.status_code >= 400:
-                return (
-                    f"starm_solve: {base} rejected the request "
-                    f"(HTTP {resp.status_code}): {_starm_detail(resp)}"
-                )
+    else:  # a task added to _STARM_TASK_IDS but not given its own solver yet
 
-            try:
-                data = resp.json()
-            except Exception as exc:  # noqa: BLE001
-                return f"starm_solve error: {base} returned a non-JSON body: {exc}"
-            if not isinstance(data, dict):
-                return f"starm_solve error: unexpected response shape from {base}"
+        async def solver(input_problem: str) -> str:  # type: ignore[misc]
+            """Solve one algorithmic puzzle."""
+            return await send(input_problem)
 
-            output = str(data.get("output", "")).strip()
-            if not output:
-                return (
-                    f"starm_solve: {base} returned an empty answer "
-                    f"for the {served!r} task."
-                )
-            steps = data.get("steps")
-            max_steps = data.get("max_steps")
-            trace = (
-                f" in {steps}/{max_steps} recursion steps"
-                if steps is not None and max_steps is not None
-                else ""
+    solver.__name__ = tool
+    return solver
+
+
+def starm_solver_ports(tools_cfg: Any | None) -> dict[str, int]:
+    """Task -> port for every STARM server this deployment configures.
+
+    A solver is only registered (and only advertised) for a task with a
+    server behind it, so a planner never picks one that cannot answer.
+    Unknown task names and unusable ports are dropped with a warning.
+    """
+    raw = dict(getattr(tools_cfg, "starm_ports", None) or {}) if tools_cfg else {}
+    out: dict[str, int] = {}
+    for name, value in raw.items():
+        task_id = str(name).strip().lower().replace("-", "_")
+        port = _coerce_port(value)
+        if task_id not in _STARM_TASK_IDS or port is None:
+            _log.warning(
+                "ignoring starm_ports entry %r=%r (task must be one of %s, "
+                "port must be 1-65535)",
+                name,
+                value,
+                ", ".join(_STARM_TASK_IDS),
             )
-            return f"STARM {served!r}{trace}:\n{output}"
-
-    return starm_solve
+            continue
+        out[task_id] = port
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -910,9 +954,9 @@ def current_datetime() -> str:
 
 
 def register_builtin_tools(
-    context: Any,
-    tools_cfg: Any,
-    sandbox_cfg: Any | None = None,
+        context: Any,
+        tools_cfg: Any,
+        sandbox_cfg: Any | None = None,
 ) -> list[str]:
     """Register the bundled tools onto ``context``.
 
@@ -953,8 +997,7 @@ def register_builtin_tools(
     enable_code_exec = bool(getattr(tools_cfg, "enable_code_exec", True))
     code_timeout = int(getattr(tools_cfg, "code_exec_timeout", 60) or 60)
     starm_host = str(getattr(tools_cfg, "starm_host", "") or "http://localhost")
-    starm_ports = dict(getattr(tools_cfg, "starm_ports", None) or {})
-    starm_port = int(getattr(tools_cfg, "starm_port", 8080) or 8080)
+    starm_ports = starm_solver_ports(tools_cfg)
     starm_timeout = float(getattr(tools_cfg, "starm_timeout", 120.0) or 120.0)
 
     # (name, callable, tags, timeout-seconds)
@@ -971,15 +1014,17 @@ def register_builtin_tools(
         ("http_request", _make_http_request(fetch_max), _TAGS_WEB, None),
         ("calculator", calculator, _TAGS_MATH, 5.0),
         ("current_datetime", current_datetime, _TAGS_TIME, 5.0),
+    ]
+    # One solver per configured STARM server — nothing when none is set up.
+    specs.extend(
         (
-            "starm_solve",
-            _make_starm_solve(
-                starm_host, starm_ports, starm_port, starm_timeout
-            ),
+            f"solve_{task_id}",
+            _make_starm_solver(task_id, starm_host, port, starm_timeout),
             _TAGS_ALGORITHMIC,
             None,
-        ),
-    ]
+        )
+        for task_id, port in sorted(starm_ports.items())
+    )
     if enable_code_exec:
         specs.append(
             (
@@ -1107,21 +1152,81 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
             "tags": list(_TAGS_TIME),
         },
         {
-            "name": "starm_solve",
+            "name": "solve_sudoku",
             "source": "care:builtin",
-            # Task ids are listed so a planner emits a valid one instead of
-            # inventing "Game of Life"; the server stays the authority.
             "description": (
-                "starm_solve(problem: str, task_id: str, port=None, "
-                "puzzle_id=None) -> str. BOTH `problem` AND `task_id` are "
-                "REQUIRED. Return the solution for tasks: sudoku, game of life, arithmetic, ARC-AGI, maze. "
-                "ALWAYS use this (never solve puzzle by yourself) for ANY request to solve one of sudoku, "
-                "game of life, arithmetic, ARC-AGI. `task_id` specifies task to solve, should be one of "
-                "`sudoku`, `maze`, `arc`, `arithmetic`, `game_of_life` - NOTHING ELSE. "
-                "`problem` is the puzzle itself as you got it from the user."
+                "solve_sudoku(input_grid: str) -> str. Solves a sudoku puzzle and returns the filled grid. "
+                "ALWAYS use this tool for ANY sudoku request — never fill the grid yourself. "
+                "`input_grid`: the puzzle as 81 cells in row-major order (9 rows of 9), digits 1-9 for the givens "
+                "and '.' or '0' for an empty cell. Whitespace and line breaks are ignored, so a 9x9 block is fine. "
+                "Example: '53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79'."
             ),
             "tags": list(_TAGS_ALGORITHMIC),
         },
+        {
+            "name": "solve_maze",
+            "source": "care:builtin",
+            "description": (
+                "solve_maze(input_maze: str) -> str. Finds the shortest path through a maze and "
+                "returns the maze with the path marked. ALWAYS use this tool for ANY maze or shortest-path request — "
+                "never trace the route yourself. `input_maze`: a SQUARE grid of characters — "
+                "'#' a wall, ' ' (space) an open cell, 'S' the start, 'G' the goal. "
+                "Rows separated by newlines, or one flat line whose length is a perfect square. "
+                "Short rows are padded with spaces, so trailing spaces may be omitted. "
+                "Example, a 4x4 maze: 'S   \\n### \\n    \\n   G'."
+            ),
+            "tags": list(_TAGS_ALGORITHMIC),
+        },
+        {
+            "name": "solve_arc",
+            "source": "care:builtin",
+            "description": (
+                "solve_arc(input_grid: str, puzzle_id: str) -> str. Solves an ARC-AGI puzzle — applies the "
+                "transformation a task's examples demonstrate — and returns the output grid. ALWAYS use this tool "
+                "for ANY ARC-AGI request — never work the transformation out yourself. "
+                "`input_grid`: the grid as colour digits 0-9, with '<eos>' between rows (cells may also "
+                "be separated by spaces or commas). Up to 30 rows. "
+                "Example, a 3x3 grid: '000<eos>010<eos>000'. "
+                "`puzzle_id`: the ARC-AGI task id the grid belongs to, e.g. '007bbfb7'. It is required: it tells "
+                "the model which task this is, and a grid alone does not say."
+            ),
+            "tags": list(_TAGS_ALGORITHMIC),
+        },
+        {
+            "name": "solve_arithmetic",
+            "source": "care:builtin",
+            "description": (
+                "solve_arithmetic(input_expression: str) -> str. Recovers the missing operators of an arithmetic expression — "
+                "which +, -, * or / make it reach its target — and returns them. ALWAYS use this tool for ANY such "
+                "request — never search for the operators yourself. "
+                "`input_expression`: the expression in REVERSE POLISH (postfix) notation — single digits and operators "
+                "run together, no spaces — with '?' in place of EVERY operator to recover, then '=' and the "
+                "target value. Exactly one '=' and at least one '?'. Example: '34?5?=35'"
+            ),
+            "tags": list(_TAGS_ALGORITHMIC),
+        },
+        {
+            "name": "solve_game_of_life",
+            "source": "care:builtin",
+            "description": (
+                "solve_game_of_life(input_pattern: str, evolutions: int) -> str. Predicts what a Conway's Game "
+                "of Life pattern looks like after a given number of evolutions, and returns that pattern. ALWAYS "
+                "use this tool for ANY Game of Life request — never evolve the pattern yourself. "
+                "`input_pattern`: the starting pattern, where 'o' is a live cell, 'b' a dead one and '$' ends "
+                "a row. Example: 'bbb$ooo$bbb' is a horizontal blinker on a 3x3 board. "
+                "`evolutions`: after how many evolutions to predict the pattern, as a whole number, e.g. 1."
+            ),
+            "tags": list(_TAGS_ALGORITHMIC),
+        },
+    ]
+    # A solve_* tool exists only where a STARM server is configured for its
+    # task, so don't advertise the others: the planner would pick a tool that
+    # isn't registered at run time.
+    served = {f"solve_{task_id}" for task_id in starm_solver_ports(tools_cfg)}
+    specs = [
+        spec
+        for spec in specs
+        if not spec["name"].startswith("solve_") or spec["name"] in served
     ]
     enable_code = True if tools_cfg is None else bool(
         getattr(tools_cfg, "enable_code_exec", True)
