@@ -1334,19 +1334,13 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
             "source": "care:builtin",
             "description": (
                 "solve_arc_agi_1(input_grid: str, puzzle_id: str = '', few_shot: str = '') -> str. "
-                "Solves an ARC-AGI-1 puzzle — applies the transformation a task's examples "
-                "demonstrate — and returns the output grid. ALWAYS use this tool for ANY ARC-AGI-1 "
-                "request — never work the transformation out yourself. "
-                "`input_grid`: the grid to transform, as colour digits 0-9 with '<eos>' between "
-                "rows (cells may also be separated by spaces or commas). Up to 30 rows. "
+                "Solves an ARC-AGI-1 puzzle. ALWAYS use this tool for ANY ARC-AGI-1 request. "
+                "`input_grid`: the grid to transform, as digits 0-9 with '<eos>' between rows. "
                 "Example, a 3x3 grid: '000<eos>010<eos>000'. "
-                "A grid alone does not say which task it belongs to, so give ONE of the next two. "
-                "`puzzle_id`: the ARC-AGI-1 task id, e.g. '007bbfb7' — use it whenever the task "
-                "is named. "
-                "`few_shot`: ALL of the task's demonstration pairs, when the id is unknown — a "
-                "JSON list [{\"input\": [[0,1],[1,0]], \"output\": [[1,0],[0,1]]}, ...], or the "
-                "whole ARC task JSON. The id is looked up from them, so a partial set resolves "
-                "nothing. Passing both uses `puzzle_id` and ignores `few_shot`."
+                "Give ONE of the next two. "
+                "`puzzle_id`: the ARC-AGI-1 task id, e.g. '007bbfb7'. "
+                "`few_shot`:  a JSON list [{\"input\": [[0,1],[1,0]], \"output\": [[1,0],[0,1]]}, ...] "
+                "with task's demonstration pairs."
             ),
             "tags": list(_TAGS_ALGORITHMIC),
         },
@@ -1355,19 +1349,13 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
             "source": "care:builtin",
             "description": (
                 "solve_arc_agi_2(input_grid: str, puzzle_id: str = '', few_shot: str = '') -> str. "
-                "Solves an ARC-AGI-2 puzzle — applies the transformation a task's examples "
-                "demonstrate — and returns the output grid. ALWAYS use this tool for ANY ARC-AGI-2 "
-                "request — never work the transformation out yourself. "
-                "`input_grid`: the grid to transform, as colour digits 0-9 with '<eos>' between "
-                "rows (cells may also be separated by spaces or commas). Up to 30 rows. "
+                "Solves an ARC-AGI-2 puzzle. ALWAYS use this tool for ANY ARC-AGI-2 request. "
+                "`input_grid`: the grid to transform, as digits 0-9 with '<eos>' between rows. "
                 "Example, a 3x3 grid: '000<eos>010<eos>000'. "
-                "A grid alone does not say which task it belongs to, so give ONE of the next two. "
-                "`puzzle_id`: the ARC-AGI-2 task id, e.g. '007bbfb7' — use it whenever the task "
-                "is named. "
-                "`few_shot`: ALL of the task's demonstration pairs, when the id is unknown — a "
-                "JSON list [{\"input\": [[0,1],[1,0]], \"output\": [[1,0],[0,1]]}, ...], or the "
-                "whole ARC task JSON. The id is looked up from them, so a partial set resolves "
-                "nothing. Passing both uses `puzzle_id` and ignores `few_shot`."
+                "Give ONE of the next two. "
+                "`puzzle_id`: the ARC-AGI-2 task id, e.g. '007bbfb7'. "
+                "`few_shot`:  a JSON list [{\"input\": [[0,1],[1,0]], \"output\": [[1,0],[0,1]]}, ...] "
+                "with task's demonstration pairs."
             ),
             "tags": list(_TAGS_ALGORITHMIC),
         },
