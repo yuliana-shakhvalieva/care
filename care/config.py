@@ -519,8 +519,9 @@ class ToolsConfig(BaseModel):
     """Which STARM server serves which task — ``{"sudoku": 8080, "maze":
     8081}``. CARE registers one solver tool per entry (``solve_sudoku``,
     ``solve_maze``, …), so this list decides which STARM tools exist at all;
-    empty means none. Tasks are STARM's own ids: ``sudoku``, ``maze``,
-    ``arc``, ``arithmetic``, ``game_of_life``. Configure under
+    empty means none. Tasks: ``sudoku``, ``maze``, ``arc_agi_1``,
+    ``arc_agi_2``, ``arithmetic``, ``game_of_life`` — the two ARC datasets are
+    separate checkpoints on separate ports, so they are separate entries. Configure under
     ``[tools.starm_ports]`` in TOML, or as
     ``CARE_TOOLS__STARM_PORTS=sudoku=8080,maze=8081`` (a JSON object is
     accepted too)."""

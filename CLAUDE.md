@@ -53,6 +53,8 @@ care/
 │                          calculator, current_datetime, run_python (gated by tools.enable_builtins)
 │                          + one solve_<task> per configured STARM server (tools.starm_ports)
 ├── tool_synthesis.py      Self-healing missing tools: disk cache → Memory → LLM-synthesise (sandboxed)
+├── runtime/arc_index.py   Recognises an ARC task from its demonstrations (fills solve_arc's puzzle_id)
+│                          from hand-written care/runtime/data/arc_agi_{1,2}_index.json
 ├── capability_priming.py  Tells MAGE about locally-installed skills/MCP/tools before planning
 ├── runtime/               ~70 adapters, one rule per file (upstream callback → Textual Message, etc.)
 │   ├── i18n.py               t(key) lookup over locales/{en,ru}.json — see "Localization" below

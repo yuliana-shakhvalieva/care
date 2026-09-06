@@ -135,6 +135,7 @@ include = [
     "care/assets/*.png",
     "care/styles/*.tcss",
     "care/runtime/locales/*.json",
+    "care/runtime/data/*.json",
 ]
 # Note: uv.lock is intentionally NOT bundled. It's .gitignored (absent in CI),
 # can't be regenerated on a clean runner (the editable [tool.uv.sources] point

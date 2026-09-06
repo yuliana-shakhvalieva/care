@@ -36,6 +36,7 @@ Design rules for anything added here:
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -654,19 +655,6 @@ async def _force_remove_container(name: str) -> None:
 # STARM solvers — one tool per task, each a single call to its own server
 # ---------------------------------------------------------------------------
 
-#: STARM's task ids, as its tokenizer registry spells them. One server serves
-#: one of these; CARE registers ``solve_<task>`` for each one configured in
-#: ``tools.starm_ports``, so a planner picks a solver by NAME instead of
-#: passing an identifier it can get wrong.
-_STARM_TASK_IDS: tuple[str, ...] = (
-    "sudoku",
-    "maze",
-    "arc",
-    "arithmetic",
-    "game_of_life",
-)
-
-
 def _coerce_port(value: Any) -> int | None:
     """Parse a port out of a config value. ``None`` when it isn't a usable
     TCP port, so the caller can say so instead of talking to the wrong
@@ -725,7 +713,7 @@ def _starm_detail(response: Any) -> str:
 async def _starm_generate(
         *,
         tool: str,
-        task_id: str,
+        task: str,
         base: str,
         problem: str,
         argument: str = "input_problem",
@@ -744,7 +732,7 @@ async def _starm_generate(
     if not text:
         return f"{tool}: nothing to solve — pass the puzzle as `{argument}`."
 
-    payload: dict[str, Any] = {"task": task_id, "input": text}
+    payload: dict[str, Any] = {"task": task, "input": text}
     if puzzle_id:
         payload["puzzle_id"] = puzzle_id
     try:
@@ -779,100 +767,264 @@ async def _starm_generate(
         if steps is not None and max_steps is not None
         else ""
     )
-    return f"STARM {task_id!r}{trace}:\n{output}"
+    return f"STARM {task!r}{trace}:\n{output}"
 
 
-def _make_starm_solver(
-        task_id: str, host: str, port: int, timeout: float
-) -> Callable[..., Any]:
-    """Build the solver for one task, bound to its server.
-
-    One function per task rather than one generic wrapper: each names its
-    argument after what that puzzle actually is (``input_grid``,
-    ``input_maze``, …), which is the strongest hint a planner gets — a
-    parameter called ``problem`` invites the user's question instead of the
-    puzzle. ARC and Game of Life also take a second argument of their own.
-    """
-    tool = f"solve_{task_id}"
+def _make_solve_sudoku(host: str, port: int, timeout: float) -> Callable[..., Any]:
+    """Build ``solve_sudoku`` bound to its server."""
     base = _starm_base_url(host, port)
 
-    # Named per task so the empty-input message points at the right argument.
-    argument = {
-        "sudoku": "input_grid",
-        "maze": "input_maze",
-        "arithmetic": "input_expression",
-        "arc": "input_grid",
-        "game_of_life": "input_pattern",
-    }.get(task_id, "input_problem")
-
-    async def send(problem: str, puzzle_id: str = "") -> str:
+    async def solve_sudoku(input_grid: str) -> str:
+        """Fill in a sudoku grid."""
         return await _starm_generate(
-            tool=tool,
-            task_id=task_id,
+            tool="solve_sudoku",
+            task="sudoku",
             base=base,
-            problem=problem,
-            argument=argument,
-            puzzle_id=puzzle_id,
+            problem=input_grid,
+            argument="input_grid",
             timeout=timeout,
         )
 
-    if task_id == "sudoku":
+    return solve_sudoku
 
-        async def solver(input_grid: str) -> str:
-            """Fill in a sudoku grid."""
-            return await send(input_grid)
 
-    elif task_id == "maze":
+def _make_solve_maze(host: str, port: int, timeout: float) -> Callable[..., Any]:
+    """Build ``solve_maze`` bound to its server."""
+    base = _starm_base_url(host, port)
 
-        async def solver(input_maze: str) -> str:  # type: ignore[misc]
-            """Find the shortest path through a maze."""
-            return await send(input_maze)
+    async def solve_maze(input_maze: str) -> str:
+        """Find the shortest path through a maze."""
+        return await _starm_generate(
+            tool="solve_maze",
+            task="maze",
+            base=base,
+            problem=input_maze,
+            argument="input_maze",
+            timeout=timeout,
+        )
 
-    elif task_id == "arithmetic":
+    return solve_maze
 
-        async def solver(input_expression: str) -> str:  # type: ignore[misc]
-            """Recover the masked operators of an expression."""
-            return await send(input_expression)
 
-    elif task_id == "arc":
+def _make_solve_arithmetic(host: str, port: int, timeout: float) -> Callable[..., Any]:
+    """Build ``solve_arithmetic`` bound to its server."""
+    base = _starm_base_url(host, port)
 
-        async def solver(input_grid: str, puzzle_id: str) -> str:  # type: ignore[misc]
-            """Apply an ARC-AGI task's transformation to a grid.
+    async def solve_arithmetic(input_expression: str) -> str:
+        """Recover the masked operators of an expression."""
+        return await _starm_generate(
+            tool="solve_arithmetic",
+            task="arithmetic",
+            base=base,
+            problem=input_expression,
+            argument="input_expression",
+            timeout=timeout,
+        )
 
-            The checkpoint keeps what it knows about a task in a learned
-            puzzle embedding, so the server needs the task's id to select
-            one — a grid alone doesn't say which task it belongs to.
-            """
-            return await send(input_grid, str(puzzle_id or "").strip())
+    return solve_arithmetic
 
-    elif task_id == "game_of_life":
 
-        async def solver(input_pattern: str, evolutions: int) -> str:  # type: ignore[misc]
-            """Predict a Life pattern after ``evolutions`` evolutions."""
-            # The server takes one string, "<pattern>|<evolutions>". The count
-            # is asked for as its own argument rather than as punctuation
-            # inside the pattern: a planner reliably fills a named parameter
-            # and just as reliably forgets a '|N' suffix.
-            try:
-                count = int(str(evolutions).strip())
-            except (TypeError, ValueError):
-                return (
-                    "solve_game_of_life: `evolutions` must be a whole number, "
-                    f"got {evolutions!r}."
-                )
-            if count < 0:
-                return "solve_game_of_life: `evolutions` cannot be negative."
-            pattern = str(input_pattern or "").strip()
-            return await send(f"{pattern}|{count}" if pattern else "")
+def _parse_arc_few_shot(value: Any) -> list[dict[str, Any]] | None:
+    """Read ARC demonstration pairs out of whatever the caller passed.
 
-    else:  # a task added to _STARM_TASK_IDS but not given its own solver yet
+    Three shapes are accepted, because all three turn up: a JSON string (what
+    a planner emits for a structured argument), an already-parsed list (what
+    CARL hands over when the step input is structured), and a whole ARC task
+    JSON, whose demonstrations live under ``train``. ``None`` means "not
+    demonstrations", so the caller can say what it expected instead of
+    guessing.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        # A whole ARC task: {"train": [...], "test": [...]}.
+        value = value.get("train")
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    pairs = [item for item in value if isinstance(item, dict)]
+    return pairs or None
 
-        async def solver(input_problem: str) -> str:  # type: ignore[misc]
-            """Solve one algorithmic puzzle."""
-            return await send(input_problem)
 
-    solver.__name__ = tool
-    return solver
+async def _arc_solve(
+        *,
+        tool: str,
+        index_filename: str,
+        base: str,
+        timeout: float,
+        input_grid: str,
+        puzzle_id: str,
+        few_shot: Any,
+) -> str:
+    """The body both ARC solvers share.
+
+    ARC is the one task whose prompt does not identify itself: the checkpoint
+    keeps what it knows about a task in a learned puzzle embedding, selected by
+    the task's id, and a grid alone doesn't say which task it belongs to. A
+    caller holding the demonstrations but not the id passes them as
+    ``few_shot``, and the id is looked up from the bundled index
+    (:mod:`care.runtime.arc_index`).
+
+    ARC-AGI-1 and ARC-AGI-2 are separate checkpoints on separate ports with
+    separate embedding tables, hence the per-dataset ``index_filename``.
+    """
+    from care.runtime.arc_index import lookup_puzzle_id
+
+    given_id = str(puzzle_id or "").strip()
+    notice = ""
+
+    if given_id and few_shot:
+        # Both supplied: the explicit id wins, but say so — silently dropping
+        # an argument is how a caller ends up believing the demonstrations
+        # were used.
+        notice = (
+            f"{tool}: both puzzle_id and few_shot given — using "
+            f"puzzle_id {given_id!r}, ignoring few_shot.\n"
+        )
+        _log.warning(
+            "%s: puzzle_id %r given alongside few_shot; ignoring few_shot",
+            tool,
+            given_id,
+        )
+    elif not given_id:
+        if not few_shot:
+            return (
+                f"{tool}: pass either `puzzle_id` (the ARC-AGI task id) or "
+                "`few_shot` (the task's demonstration pairs) — a grid alone "
+                "does not say which task it belongs to."
+            )
+        pairs = _parse_arc_few_shot(few_shot)
+        if pairs is None:
+            return (
+                f"{tool}: could not read `few_shot`. Pass the task's "
+                'demonstrations as [{"input": [[..]], "output": [[..]]}, '
+                "...], or the whole ARC task JSON."
+            )
+        given_id = lookup_puzzle_id(pairs, index_filename)
+        if not given_id:
+            return (
+                f"{tool}: these demonstrations match no task the checkpoint "
+                "was trained on, so there is no puzzle embedding to use. "
+                "Pass ALL of the task's demonstrations, or `puzzle_id` if "
+                "you know it."
+            )
+        _log.info("%s: few_shot resolved to puzzle_id %r", tool, given_id)
+
+    answer = await _starm_generate(
+        tool=tool,
+        task="arc",
+        base=base,
+        problem=input_grid,
+        argument="input_grid",
+        puzzle_id=given_id,
+        timeout=timeout,
+    )
+    return notice + answer
+
+
+def _make_solve_arc_agi_1(host: str, port: int, timeout: float) -> Callable[..., Any]:
+    """Build ``solve_arc_agi_1`` bound to the ARC-AGI-1 server."""
+    from care.runtime.arc_index import ARC_AGI_1_INDEX
+
+    base = _starm_base_url(host, port)
+
+    async def solve_arc_agi_1(
+            input_grid: str, puzzle_id: str = "", few_shot: Any = ""
+    ) -> str:
+        """Apply an ARC-AGI-1 task's transformation to a grid."""
+        return await _arc_solve(
+            tool="solve_arc_agi_1",
+            index_filename=ARC_AGI_1_INDEX,
+            base=base,
+            timeout=timeout,
+            input_grid=input_grid,
+            puzzle_id=puzzle_id,
+            few_shot=few_shot,
+        )
+
+    return solve_arc_agi_1
+
+
+def _make_solve_arc_agi_2(host: str, port: int, timeout: float) -> Callable[..., Any]:
+    """Build ``solve_arc_agi_2`` bound to the ARC-AGI-2 server."""
+    from care.runtime.arc_index import ARC_AGI_2_INDEX
+
+    base = _starm_base_url(host, port)
+
+    async def solve_arc_agi_2(
+            input_grid: str, puzzle_id: str = "", few_shot: Any = ""
+    ) -> str:
+        """Apply an ARC-AGI-2 task's transformation to a grid."""
+        return await _arc_solve(
+            tool="solve_arc_agi_2",
+            index_filename=ARC_AGI_2_INDEX,
+            base=base,
+            timeout=timeout,
+            input_grid=input_grid,
+            puzzle_id=puzzle_id,
+            few_shot=few_shot,
+        )
+
+    return solve_arc_agi_2
+
+
+def _make_solve_game_of_life(
+        host: str, port: int, timeout: float
+) -> Callable[..., Any]:
+    """Build ``solve_game_of_life`` bound to its server."""
+    base = _starm_base_url(host, port)
+
+    async def solve_game_of_life(input_pattern: str, evolutions: int) -> str:
+        """Predict a Life pattern after ``evolutions`` evolutions."""
+        # The server takes one string, "<pattern>|<evolutions>". The count is
+        # asked for as its own argument rather than as punctuation inside the
+        # pattern: a planner reliably fills a named parameter and just as
+        # reliably forgets a '|N' suffix.
+        try:
+            count = int(str(evolutions).strip())
+        except (TypeError, ValueError):
+            return (
+                "solve_game_of_life: `evolutions` must be a whole number, "
+                f"got {evolutions!r}."
+            )
+        if count < 0:
+            return "solve_game_of_life: `evolutions` cannot be negative."
+        pattern = str(input_pattern or "").strip()
+        return await _starm_generate(
+            tool="solve_game_of_life",
+            task="game_of_life",
+            base=base,
+            problem=f"{pattern}|{count}" if pattern else "",
+            argument="input_pattern",
+            timeout=timeout,
+        )
+
+    return solve_game_of_life
+
+
+#: Task id (as STARM's tokenizer registry spells it, and as
+#: ``tools.starm_ports`` keys it) → the factory for that task's tool. Each
+#: solver is an independent function: its own name, its own arguments named
+#: after its own puzzle, its own quirks. Nothing dispatches on the task at call
+#: time.
+_STARM_SOLVER_FACTORIES: dict[str, Callable[[str, int, float], Callable[..., Any]]] = {
+    "sudoku": _make_solve_sudoku,
+    "maze": _make_solve_maze,
+    "arc_agi_1": _make_solve_arc_agi_1,
+    "arc_agi_2": _make_solve_arc_agi_2,
+    "arithmetic": _make_solve_arithmetic,
+    "game_of_life": _make_solve_game_of_life,
+}
+
+#: The tasks CARE can serve, as ``tools.starm_ports`` keys them. A planner
+#: picks a solver by NAME (``solve_sudoku``), never by passing an identifier
+#: it could get wrong.
+_STARM_TASKS: tuple[str, ...] = tuple(_STARM_SOLVER_FACTORIES)
 
 
 def starm_solver_ports(tools_cfg: Any | None) -> dict[str, int]:
@@ -885,18 +1037,18 @@ def starm_solver_ports(tools_cfg: Any | None) -> dict[str, int]:
     raw = dict(getattr(tools_cfg, "starm_ports", None) or {}) if tools_cfg else {}
     out: dict[str, int] = {}
     for name, value in raw.items():
-        task_id = str(name).strip().lower().replace("-", "_")
+        task = str(name).strip().lower().replace("-", "_")
         port = _coerce_port(value)
-        if task_id not in _STARM_TASK_IDS or port is None:
+        if task not in _STARM_TASKS or port is None:
             _log.warning(
                 "ignoring starm_ports entry %r=%r (task must be one of %s, "
                 "port must be 1-65535)",
                 name,
                 value,
-                ", ".join(_STARM_TASK_IDS),
+                ", ".join(_STARM_TASKS),
             )
             continue
-        out[task_id] = port
+        out[task] = port
     return out
 
 
@@ -1018,12 +1170,12 @@ def register_builtin_tools(
     # One solver per configured STARM server — nothing when none is set up.
     specs.extend(
         (
-            f"solve_{task_id}",
-            _make_starm_solver(task_id, starm_host, port, starm_timeout),
+            f"solve_{task}",
+            _STARM_SOLVER_FACTORIES[task](starm_host, port, starm_timeout),
             _TAGS_ALGORITHMIC,
             None,
         )
-        for task_id, port in sorted(starm_ports.items())
+        for task, port in sorted(starm_ports.items())
     )
     if enable_code_exec:
         specs.append(
@@ -1178,17 +1330,44 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
             "tags": list(_TAGS_ALGORITHMIC),
         },
         {
-            "name": "solve_arc",
+            "name": "solve_arc_agi_1",
             "source": "care:builtin",
             "description": (
-                "solve_arc(input_grid: str, puzzle_id: str) -> str. Solves an ARC-AGI puzzle — applies the "
-                "transformation a task's examples demonstrate — and returns the output grid. ALWAYS use this tool "
-                "for ANY ARC-AGI request — never work the transformation out yourself. "
-                "`input_grid`: the grid as colour digits 0-9, with '<eos>' between rows (cells may also "
-                "be separated by spaces or commas). Up to 30 rows. "
+                "solve_arc_agi_1(input_grid: str, puzzle_id: str = '', few_shot: str = '') -> str. "
+                "Solves an ARC-AGI-1 puzzle — applies the transformation a task's examples "
+                "demonstrate — and returns the output grid. ALWAYS use this tool for ANY ARC-AGI-1 "
+                "request — never work the transformation out yourself. "
+                "`input_grid`: the grid to transform, as colour digits 0-9 with '<eos>' between "
+                "rows (cells may also be separated by spaces or commas). Up to 30 rows. "
                 "Example, a 3x3 grid: '000<eos>010<eos>000'. "
-                "`puzzle_id`: the ARC-AGI task id the grid belongs to, e.g. '007bbfb7'. It is required: it tells "
-                "the model which task this is, and a grid alone does not say."
+                "A grid alone does not say which task it belongs to, so give ONE of the next two. "
+                "`puzzle_id`: the ARC-AGI-1 task id, e.g. '007bbfb7' — use it whenever the task "
+                "is named. "
+                "`few_shot`: ALL of the task's demonstration pairs, when the id is unknown — a "
+                "JSON list [{\"input\": [[0,1],[1,0]], \"output\": [[1,0],[0,1]]}, ...], or the "
+                "whole ARC task JSON. The id is looked up from them, so a partial set resolves "
+                "nothing. Passing both uses `puzzle_id` and ignores `few_shot`."
+            ),
+            "tags": list(_TAGS_ALGORITHMIC),
+        },
+        {
+            "name": "solve_arc_agi_2",
+            "source": "care:builtin",
+            "description": (
+                "solve_arc_agi_2(input_grid: str, puzzle_id: str = '', few_shot: str = '') -> str. "
+                "Solves an ARC-AGI-2 puzzle — applies the transformation a task's examples "
+                "demonstrate — and returns the output grid. ALWAYS use this tool for ANY ARC-AGI-2 "
+                "request — never work the transformation out yourself. "
+                "`input_grid`: the grid to transform, as colour digits 0-9 with '<eos>' between "
+                "rows (cells may also be separated by spaces or commas). Up to 30 rows. "
+                "Example, a 3x3 grid: '000<eos>010<eos>000'. "
+                "A grid alone does not say which task it belongs to, so give ONE of the next two. "
+                "`puzzle_id`: the ARC-AGI-2 task id, e.g. '007bbfb7' — use it whenever the task "
+                "is named. "
+                "`few_shot`: ALL of the task's demonstration pairs, when the id is unknown — a "
+                "JSON list [{\"input\": [[0,1],[1,0]], \"output\": [[1,0],[0,1]]}, ...], or the "
+                "whole ARC task JSON. The id is looked up from them, so a partial set resolves "
+                "nothing. Passing both uses `puzzle_id` and ignores `few_shot`."
             ),
             "tags": list(_TAGS_ALGORITHMIC),
         },
@@ -1196,11 +1375,12 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
             "name": "solve_arithmetic",
             "source": "care:builtin",
             "description": (
-                "solve_arithmetic(input_expression: str) -> str. Recovers the missing operators of an arithmetic expression — "
-                "which +, -, * or / make it reach its target — and returns them. ALWAYS use this tool for ANY such "
-                "request — never search for the operators yourself. "
-                "`input_expression`: the expression in REVERSE POLISH (postfix) notation — single digits and operators "
-                "run together, no spaces — with '?' in place of EVERY operator to recover, then '=' and the "
+                "solve_arithmetic(input_expression: str) -> str. Recovers the missing operators of an "
+                "arithmetic expression — which +, -, * or / make it reach its target — and returns them. "
+                "ALWAYS use this tool for ANY such request — never search for the operators yourself. "
+                "`input_expression`: the expression in REVERSE POLISH (postfix) notation — single digits "
+                "and operators run together, no spaces — with '?' in place of EVERY operator to recover, "
+                "then '=' and the "
                 "target value. Each operator applies to the two values immediately before it, so '34+5*' unfolds as "
                 "(3+4)=7, then 7*5=35. Exactly one '=' and at least one '?'. Example: '34?5?=35', whose answer is "
                 "'+' then '*'."
@@ -1224,7 +1404,7 @@ def builtin_tool_specs(tools_cfg: Any | None = None) -> list[dict[str, Any]]:
     # A solve_* tool exists only where a STARM server is configured for its
     # task, so don't advertise the others: the planner would pick a tool that
     # isn't registered at run time.
-    served = {f"solve_{task_id}" for task_id in starm_solver_ports(tools_cfg)}
+    served = {f"solve_{task}" for task in starm_solver_ports(tools_cfg)}
     specs = [
         spec
         for spec in specs
